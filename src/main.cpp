@@ -9,7 +9,8 @@
 #include <BleMouse.h>
 
 MPU6050 mpu(Wire);
-BleMouse bleMouse("AirMouse-ESP32");
+// Set BLE device name shown to hosts
+BleMouse bleMouse("ESP Air 1");
 
 // Forward declarations for functions defined later in this file
 void detectFlick(float gx, float gy, float gz, unsigned long now);
