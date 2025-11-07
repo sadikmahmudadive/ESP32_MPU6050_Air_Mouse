@@ -6,17 +6,96 @@
 
 #include <Wire.h>
 #include <MPU6050_tockn.h>
+
+// Compile-time feature flags
+#ifndef USE_WIFI_MOUSE
+#define USE_WIFI_MOUSE 1
+#endif
+#ifndef USE_BLE_MOUSE
+#define USE_BLE_MOUSE 0
+#endif
+
+#if USE_BLE_MOUSE
 #include <BleMouse.h>
+#endif
+#include <WiFi.h>
+#include <WebServer.h>
+#include <Preferences.h>
+#include <WiFiUdp.h>
 
 MPU6050 mpu(Wire);
-// Set BLE device name shown to hosts
+#if USE_BLE_MOUSE
+// BLE is still available but we will use Wi-Fi mouse by default
 BleMouse bleMouse("ESP Air 1");
+#endif
 
-// Forward declarations for functions defined later in this file
+// Wi-Fi provisioning / UDP mouse globals
+Preferences prefs;
+WebServer server(80);
+WiFiUDP udp;
+const uint16_t UDP_PORT = 5555;
+bool useWiFiMouse = true; // toggle to switch between BLE HID and Wi-Fi mouse
+uint8_t udp_seq = 0;
+
+const char* PREF_NS = "wifi";
+
+// --- Double-Reset Detector (use ESP32 RESET button to enter config) ---
+// If the device is reset twice within the window, the second boot enters config portal.
+RTC_DATA_ATTR uint32_t DRD_FLAG = 0;              // persists across resets (RTC memory)
+const uint32_t DRD_MAGIC = 0xA5A50F0Ful;          // magic value indicating armed state
+unsigned long drdArmedMs = 0;                     // armed time (RAM only)
+const unsigned long DRD_WINDOW_MS = 5000;         // 5s window for double reset
+
+// HTML for captive portal
+const char* cfg_html = R"rawliteral(
+<!doctype html>
+<html>
+  <head><meta charset="utf-8"><title>ESP Air Wi-Fi Setup</title></head>
+  <body>
+    <h3>ESP Air Wi-Fi Setup</h3>
+    <form method="POST" action="/save">
+      <fieldset style="margin-bottom:10px;">
+        <legend>Normal Wi‑Fi (via router)</legend>
+        SSID:<br><input type="text" name="ssid"><br>
+        Password:<br><input type="password" name="pass"><br>
+      </fieldset>
+
+      <fieldset style="margin-bottom:10px;">
+        <legend>Direct AP mode (no router)</legend>
+        <label><input type="checkbox" name="apmode"> Use Direct AP mode</label><br>
+        AP Password (8+ chars, leave empty for open):<br>
+        <input type="text" name="appass" placeholder="optional"><br>
+        The AP SSID will be: <b>ESP-Air-Mouse</b>
+      </fieldset>
+
+      <input type="submit" value="Save & Reboot">
+    </form>
+    <p>After saving, the device will reboot and attempt to join the configured Wi‑Fi network.</p>
+  </body>
+</html>
+)rawliteral";
+
+// helper to send UDP mouse packet: header(0xA5), seq, dx(int8), dy(int8), buttons
+void sendMousePacket(int8_t dx, int8_t dy, uint8_t buttons) {
+  uint8_t buf[6];
+  buf[0] = 0xA5;
+  buf[1] = udp_seq++;
+  buf[2] = (uint8_t)dx;
+  buf[3] = (uint8_t)dy;
+  buf[4] = buttons;
+  buf[5] = 0; // reserved
+  // use broadcast to reach the listening PC on the same network
+  udp.beginPacket("255.255.255.255", UDP_PORT);
+  udp.write(buf, sizeof(buf));
+  udp.endPacket();
+}
 void detectFlick(float gx, float gy, float gz, unsigned long now);
 float applyDeadzone(float valDeg, float dead);
+float softDeadzone(float x, float dead, float width);
 float mapTiltToSpeed(float tiltDeg, float sens);
+float mapTiltToSpeedSimple(float tiltDeg, float sens, float gammaExp);
 float readBatteryVoltage();
+uint8_t voltageToPercent(float v);
 void sendBrowserBack();
 void sendBrowserForward();
 void i2cScan();
@@ -24,6 +103,12 @@ uint8_t readWhoAmI();
 uint8_t readRegisterNoRestart(uint8_t devaddr, uint8_t reg);
 uint8_t readRegisterWithRestart(uint8_t devaddr, uint8_t reg);
 uint8_t readRegisterEndThenRequest(uint8_t devaddr, uint8_t reg);
+bool loadCalibration(float &outPitchOff, float &outRollOff);
+void saveCalibration(float pitchOff, float rollOff);
+void runCalibrationInteractive();
+void checkLiveZeroing(float curPitch, float curRoll, unsigned long now);
+bool loadMappingSettings();
+void saveMappingSettings();
 
 //
 // === PIN CONFIG ===
@@ -40,12 +125,23 @@ const int I2C_SCL_PIN = 22;
 //
 // === TIMING / FILTERS / TUNING ===
 const unsigned long LOOP_INTERVAL_MS = 10; // target loop time ~10ms (100Hz)
+// Reduce target loop interval to lower latency
+const unsigned long LOOP_INTERVAL_TARGET_MS = 5; // aim for ~200Hz, but keep guard for CPU
 const float alpha_comp = 0.98f; // complementary filter alpha (gyro trust)
-const float smoothing_alpha = 0.12f; // EMA smoothing for cursor deltas (0..1) - lower for smoother response
+float smoothing_alpha = 0.12f; // EMA smoothing for cursor deltas (0..1) - lower for smoother response
 const float gyroToDegPerSec = 1.0f; // gyro reading is deg/s if library gives that
-const float sensitivity = 1.6f; // sensitivity multiplier for cursor movement
-const float deadzone_deg = 2.0f; // degrees of tilt to ignore
+const float sensitivity = 1.6f; // base sensitivity multiplier
+// Simple non-linear mapping exponent
+const float gammaExp = 1.35f;   // exponent for non-linear pointer accel
+const float deadzone_deg = 1.5f; // degrees of tilt to ignore (soft deadzone)
+const float deadzone_soft_width = 1.0f; // transition width in degrees for soft deadzone
 const float maxCursorSpeed = 12.0f; // max pixels per loop step
+// Minimal output step to prevent micro jitter accumulation (pixels/loop)
+const float minOutputStep = 0.25f;
+// Adaptive smoothing
+const float smooth_low_speed = 0.08f; // EMA alpha at low speed (more smoothing)
+const float smooth_high_speed = 0.22f; // EMA alpha at high speed
+const float smooth_speed_knee = 10.0f;  // speed where alpha transitions
 const float scrollSensitivity = 0.8f; // sensitivity when in scroll mode
 
 // Gesture detection thresholds
@@ -58,9 +154,15 @@ const float flickMoveGuard = 1.0f; // pixels per loop - ignore flicks when curso
 float lastGmag = 0.0f;
 const float flickPrevMaxRatio = 0.5f; // previous gmag must be below this fraction of threshold
 
-// Battery
+// Battery measurement
+// ADC reference is nominally 3.3V (ESP32 ADC is not perfectly linear; consider calibration if needed)
 const float ADC_REF = 3.3f;
-const float VOLT_DIVIDER_RATIO = 2.0f; // example: 100k/100k -> ratio 2.0 (adjust to your resistor values)
+// Configure your actual resistor divider values:
+// R_TOP: from battery positive to ADC pin, R_BOTTOM: from ADC pin to GND
+// Example: 100k/100k -> ratio 2.0
+const float R_TOP = 100000.0f;    // ohms
+const float R_BOTTOM = 100000.0f; // ohms
+const float VOLT_DIVIDER_RATIO = (R_TOP + R_BOTTOM) / R_BOTTOM; // Vbatt = Vadc * ratio
 const float LOW_BATT_THRESHOLD = 3.4f; // per-cell threshold (LiPo single cell)
 
 // === STATE ===
@@ -76,6 +178,17 @@ float cursorAccY = 0.0f;
 
 // For gyro integration
 unsigned long lastFusionMs = 0;
+// Calibration offsets for orientation (in degrees)
+float pitchOffset = 0.0f;
+float rollOffset  = 0.0f;
+// Axis mapping settings
+bool invertX = false;
+bool invertY = false;
+bool swapXY  = false;
+// Non-blocking event blink state (for confirmations)
+unsigned long eventBlinkEnd = 0;
+unsigned long eventBlinkLast = 0;
+bool eventBlinkOn = false;
 
 // For gesture detection
 unsigned long lastFlickTime = 0;
@@ -148,11 +261,113 @@ void setup(){
   // initialize previous angle timestamps for rate calculations
   lastFusionMs = millis();
 
+  // Attempt to load saved orientation calibration; allow forcing recalibration by holding BACK at boot
+  prefs.begin(PREF_NS, false);
+  bool forceCal = (digitalRead(PIN_BACK_BTN) == LOW);
+  if (!forceCal && loadCalibration(pitchOffset, rollOffset)) {
+    Serial.print("Loaded calibration: pitchOff="); Serial.print(pitchOffset);
+    Serial.print(" rollOff="); Serial.println(rollOffset);
+  } else {
+    Serial.println(forceCal ? "Forcing orientation calibration (BACK held)" : "No saved calibration found; running orientation calibration");
+    runCalibrationInteractive();
+  }
+
+  // Load axis mapping settings (invert/swap)
+  (void)loadMappingSettings();
+
 
   lastLoop = millis();
   lastFusionMs = millis();
 
-  bleMouse.begin();
+  // Wi‑Fi provisioning and UDP setup
+  // Double-reset detection: tap RESET twice quickly to enter config portal
+  bool configMode = false;
+  if (DRD_FLAG == DRD_MAGIC) {
+    DRD_FLAG = 0; // consume
+    configMode = true;
+    Serial.println("Double reset detected -> entering config portal");
+  } else {
+    DRD_FLAG = DRD_MAGIC;     // arm DRD
+    drdArmedMs = millis();    // start disarm timer
+  }
+  // prefs already begun above for calibration; keep open
+  String stored_ssid = prefs.getString("ssid", "");
+  String stored_pass = prefs.getString("pass", "");
+
+  if (configMode || stored_ssid.length() == 0) {
+    Serial.println("Entering config portal (AP mode). Tip: double-tap the RESET button within 5s to force this mode.");
+    WiFi.mode(WIFI_AP);
+    WiFi.softAP("ESP-Air-Setup");
+    IPAddress ip = WiFi.softAPIP();
+    Serial.print("AP IP: "); Serial.println(ip);
+    server.on("/", HTTP_GET, [](){ server.send(200, "text/html", cfg_html); });
+    server.on("/save", HTTP_POST, [](){
+      String ssid = server.arg("ssid");
+      String pass = server.arg("pass");
+      String apmode = server.arg("apmode");
+      String appass = server.arg("appass");
+      bool useAP = apmode.length() > 0;
+      if (useAP) {
+        // Store sentinel to request Direct AP mode
+        prefs.putString("ssid", "__AP__");
+        prefs.putString("pass", appass);
+        server.send(200, "text/html", "Saved (Direct AP mode). Rebooting...");
+      } else {
+        prefs.putString("ssid", ssid);
+        prefs.putString("pass", pass);
+        server.send(200, "text/html", "Saved. Rebooting...");
+      }
+      delay(500);
+      ESP.restart();
+    });
+    server.begin();
+    Serial.println("Config server started at / (connect to AP 'ESP-Air-Setup')");
+  } else {
+    if (stored_ssid == "__AP__") {
+      // Direct AP mode for mouse operation
+      Serial.println("Starting Direct AP mode (ESP-Air-Mouse)");
+      WiFi.mode(WIFI_AP);
+      String apPass = stored_pass;
+      if (apPass.length() >= 8) {
+        WiFi.softAP("ESP-Air-Mouse", apPass.c_str());
+      } else {
+        WiFi.softAP("ESP-Air-Mouse");
+      }
+      IPAddress ip = WiFi.softAPIP();
+      Serial.print("AP IP: "); Serial.println(ip);
+      udp.begin(UDP_PORT);
+      Serial.printf("UDP ready (broadcast on port %d)\n", UDP_PORT);
+    } else {
+      Serial.print("Connecting to Wi‑Fi SSID: "); Serial.println(stored_ssid);
+      WiFi.mode(WIFI_STA);
+      WiFi.begin(stored_ssid.c_str(), stored_pass.c_str());
+      unsigned long startMs = millis();
+      while (WiFi.status() != WL_CONNECTED && (millis() - startMs) < 15000) {
+        delay(200);
+        Serial.print('.');
+      }
+      if (WiFi.status() == WL_CONNECTED) {
+        Serial.println();
+        Serial.print("Connected. IP: "); Serial.println(WiFi.localIP());
+        udp.begin(UDP_PORT);
+        Serial.printf("UDP ready (broadcast on port %d)\n", UDP_PORT);
+      } else {
+        Serial.println();
+        Serial.println("Failed to connect to Wi‑Fi. Entering AP config mode.");
+        prefs.remove("ssid"); prefs.remove("pass");
+        ESP.restart();
+      }
+    }
+  }
+
+    // Start BLE only if BLE mode selected and compiled in
+  #if USE_BLE_MOUSE
+    if (!useWiFiMouse) {
+      bleMouse.begin();
+      delay(200);
+      Serial.println("BLE mouse begin called");
+    }
+  #endif
 }
 
 // Simple I2C scanner to print found addresses to Serial
@@ -178,7 +393,7 @@ void i2cScan() {
 
 void loop(){
   unsigned long now = millis();
-  if (now - lastLoop < LOOP_INTERVAL_MS) return;
+  if (now - lastLoop < LOOP_INTERVAL_TARGET_MS) return;
   unsigned long dt_ms = now - lastLoop;
   lastLoop = now;
 
@@ -200,6 +415,13 @@ void loop(){
   // Complementary filter: fuse DMP angles with integrated deltas (DMP is already fused but keep tuning path)
   pitch = alpha_comp * (pitch + gy * dt) + (1.0f - alpha_comp) * newPitch;
   roll  = alpha_comp * (roll  + gx * dt) + (1.0f - alpha_comp) * newRoll;
+
+  // Apply orientation calibration offsets to align neutral position
+  float pitchCal = pitch - pitchOffset;
+  float rollCal  = roll  - rollOffset;
+
+  // Allow live zeroing and mapping toggles via button combos
+  checkLiveZeroing(pitch, roll, now);
 
   // Gesture detection: flick if large angular rate
   detectFlick(gx, gy, gz, now);
@@ -231,30 +453,102 @@ void loop(){
   float dx = 0, dy = 0;
   if (rightPressed) {
     // Scroll mode (tilt up/down to scroll)
-    float tiltY = pitch; // up/down
-    tiltY = applyDeadzone(tiltY, deadzone_deg);
+    float tiltY = pitchCal; // up/down
+    tiltY = softDeadzone(tiltY, deadzone_deg, deadzone_soft_width);
+    // Scrolling can remain simpler
     dy = mapTiltToSpeed(tiltY, scrollSensitivity);
     dx = 0;
   } else {
-    // Normal mode: roll -> X, pitch -> Y
-    float tiltX = roll;
-    float tiltY = pitch;
-    tiltX = applyDeadzone(tiltX, deadzone_deg);
-    tiltY = applyDeadzone(tiltY, deadzone_deg);
-    dx = mapTiltToSpeed(tiltX, sensitivity);
-    dy = mapTiltToSpeed(tiltY, sensitivity);
+    // Normal mode: roll -> X, pitch -> Y (will allow swap/invert below)
+    float tiltX = rollCal;
+    float tiltY = pitchCal;
+    tiltX = softDeadzone(tiltX, deadzone_deg, deadzone_soft_width);
+    tiltY = softDeadzone(tiltY, deadzone_deg, deadzone_soft_width);
+    // Apply swap and invert preferences before mapping
+    if (swapXY) {
+      float tmp = tiltX; tiltX = tiltY; tiltY = tmp;
+    }
+    if (invertX) tiltX = -tiltX;
+    if (invertY) tiltY = -tiltY;
+    // Simple, stable non-linear pointer acceleration
+    dx = mapTiltToSpeedSimple(tiltX, sensitivity, gammaExp);
+    dy = mapTiltToSpeedSimple(tiltY, sensitivity, gammaExp);
   }
 
-  // Smoothing EMA
+  // Adaptive smoothing: use higher alpha (more responsive) at higher speeds; when very fast, bypass smoothing more
+  float speedMag = sqrt(dx*dx + dy*dy);
+  float t = constrain(speedMag / smooth_speed_knee, 0.0f, 1.0f);
+  smoothing_alpha = smooth_low_speed + t * (smooth_high_speed - smooth_low_speed);
+  if (speedMag > (smooth_speed_knee * 1.6f)) {
+    // Rapid motion: further increase alpha to reduce latency
+    smoothing_alpha = min(0.45f, smoothing_alpha + 0.15f);
+  }
   smoothed_dx = smoothing_alpha * dx + (1.0f - smoothing_alpha) * smoothed_dx;
   smoothed_dy = smoothing_alpha * dy + (1.0f - smoothing_alpha) * smoothed_dy;
+  // Snap small outputs to zero to avoid visible jitter
+  if (fabs(smoothed_dx) < minOutputStep) smoothed_dx = 0.0f;
+  if (fabs(smoothed_dy) < minOutputStep) smoothed_dy = 0.0f;
 
   // Constrain max speed
   smoothed_dx = constrain(smoothed_dx, -maxCursorSpeed, maxCursorSpeed);
   smoothed_dy = constrain(smoothed_dy, -maxCursorSpeed, maxCursorSpeed);
 
-  // Send BLE mouse events
-  if (bleMouse.isConnected()) {
+  // Send mouse events over Wi‑Fi UDP or BLE
+  if (useWiFiMouse) {
+    digitalWrite(PIN_LED, HIGH);
+    // Move cursor using fractional accumulators for smooth sub-pixel motion
+    cursorAccX += smoothed_dx;
+    cursorAccY += smoothed_dy;
+    if (fabs(cursorAccX) < 0.01f) cursorAccX = 0.0f;
+    if (fabs(cursorAccY) < 0.01f) cursorAccY = 0.0f;
+    int moveX = (int)cursorAccX;
+    int moveY = (int)cursorAccY;
+    if (moveX != 0 || moveY != 0) {
+      int8_t sx = (int8_t)constrain(moveX, -127, 127);
+      int8_t sy = (int8_t)constrain(moveY, -127, 127);
+      // Include left button state continuously to support drag on the host
+      uint8_t btns = leftPressed ? 0x01 : 0x00;
+      sendMousePacket(sx, sy, btns);
+      cursorAccX -= moveX;
+      cursorAccY -= moveY;
+    }
+
+    // Left button: stateful press/release to support drag
+    if (leftPressed != prevLeftPressed) {
+      // Emit a state update even if no movement
+      sendMousePacket(0, 0, leftPressed ? 0x01 : 0x00);
+    }
+    prevLeftPressed = leftPressed;
+
+    if (backPressed && !prevBackPressed) {
+      unsigned long since = now - lastBackClickMs;
+      float moveSpeed = sqrt(smoothed_dx*smoothed_dx + smoothed_dy*smoothed_dy);
+      if (since >= MIN_CLICK_INTERVAL_MS && moveSpeed <= CLICK_MOVE_THRESHOLD) {
+        sendMousePacket(0,0,0x04);
+        lastBackClickMs = now;
+      }
+    }
+    prevBackPressed = backPressed;
+
+    const unsigned long RIGHT_HOLD_MS = 500;
+    if (rightPressed && !prevRightPressed) {
+      rightPressStartMs = now;
+    } else if (!rightPressed && prevRightPressed) {
+      unsigned long held = now - rightPressStartMs;
+      if (held < RIGHT_HOLD_MS) {
+        unsigned long since = now - lastRightClickMs;
+        float moveSpeed = sqrt(smoothed_dx*smoothed_dx + smoothed_dy*smoothed_dy);
+        if (since >= MIN_CLICK_INTERVAL_MS && moveSpeed <= CLICK_MOVE_THRESHOLD) {
+          sendMousePacket(0,0,0x02);
+          lastRightClickMs = now;
+        }
+      }
+    }
+    prevRightPressed = rightPressed;
+
+  }
+#if USE_BLE_MOUSE
+  else if (bleMouse.isConnected()) {
     digitalWrite(PIN_LED, HIGH);
     // Move cursor using fractional accumulators for smooth sub-pixel motion
     cursorAccX += smoothed_dx;
@@ -265,7 +559,11 @@ void loop(){
     int moveX = (int)cursorAccX; // trunc towards zero
     int moveY = (int)cursorAccY;
     if (moveX != 0 || moveY != 0) {
-      bleMouse.move(moveX, moveY);
+      // send via Wi-Fi UDP if enabled, otherwise use BLE
+      int8_t sx = (int8_t)constrain(moveX, -127, 127);
+      int8_t sy = (int8_t)constrain(moveY, -127, 127);
+      uint8_t btns = 0;
+      sendMousePacket(sx, sy, btns);
       cursorAccX -= moveX;
       cursorAccY -= moveY;
     }
@@ -297,7 +595,9 @@ void loop(){
         float moveSpeed = sqrt(smoothed_dx*smoothed_dx + smoothed_dy*smoothed_dy);
         if (since >= MIN_CLICK_INTERVAL_MS && moveSpeed <= CLICK_MOVE_THRESHOLD) {
           Serial.println("Button: LEFT click (tap)");
-          if (bleMouse.isConnected()) bleMouse.click(MOUSE_LEFT);
+          if (useWiFiMouse) {
+            sendMousePacket(0, 0, 0x01);
+          } else if (bleMouse.isConnected()) bleMouse.click(MOUSE_LEFT);
           lastLeftClickMs = now;
         } else {
           Serial.print("LEFT click suppressed: dt="); Serial.print(since);
@@ -312,10 +612,11 @@ void loop(){
       // throttle/back movement guard
       unsigned long since = now - lastBackClickMs;
       float moveSpeed = sqrt(smoothed_dx*smoothed_dx + smoothed_dy*smoothed_dy);
-      if (since >= MIN_CLICK_INTERVAL_MS && moveSpeed <= CLICK_MOVE_THRESHOLD) {
-        Serial.println("Button: BACK click");
-        bleMouse.click(MOUSE_BACK);
-        lastBackClickMs = now;
+        if (since >= MIN_CLICK_INTERVAL_MS && moveSpeed <= CLICK_MOVE_THRESHOLD) {
+          Serial.println("Button: BACK click");
+          if (useWiFiMouse) sendMousePacket(0,0,0x04);
+          else bleMouse.click(MOUSE_BACK);
+          lastBackClickMs = now;
       } else {
         Serial.print("BACK click suppressed: dt="); Serial.print(since);
         Serial.print("ms move="); Serial.println(moveSpeed);
@@ -337,7 +638,8 @@ void loop(){
         float moveSpeed = sqrt(smoothed_dx*smoothed_dx + smoothed_dy*smoothed_dy);
         if (since >= MIN_CLICK_INTERVAL_MS && moveSpeed <= CLICK_MOVE_THRESHOLD) {
           Serial.println("Button: RIGHT click (tap)");
-          bleMouse.click(MOUSE_RIGHT);
+          if (useWiFiMouse) sendMousePacket(0,0,0x02);
+          else bleMouse.click(MOUSE_RIGHT);
           lastRightClickMs = now;
         } else {
           Serial.print("RIGHT click suppressed: dt="); Serial.print(since);
@@ -353,6 +655,31 @@ void loop(){
     // Not connected
     digitalWrite(PIN_LED, now % 500 < 250 ? HIGH : LOW); // blink
   }
+#endif
+
+  // Handle captive portal HTTP when in AP mode
+  if (WiFi.getMode() == WIFI_AP) {
+    server.handleClient();
+  }
+
+  // Disarm DRD flag after the window if we didn't reset again
+  if (DRD_FLAG == DRD_MAGIC) {
+    unsigned long since = now - drdArmedMs;
+    if (since > DRD_WINDOW_MS) {
+      DRD_FLAG = 0;
+    }
+  }
+
+  // Keep-alive for BLE advertising when BLE mode is enabled
+#if USE_BLE_MOUSE
+  static unsigned long lastAdvWatchdog = 0;
+  const unsigned long ADV_WATCHDOG_MS = 5000;
+  if (!useWiFiMouse && !bleMouse.isConnected() && (now - lastAdvWatchdog) > ADV_WATCHDOG_MS) {
+    lastAdvWatchdog = now;
+    Serial.println("BLE adv watchdog: ensuring advertising...");
+    bleMouse.begin();
+  }
+#endif
 
   // Battery monitor (periodic, non-blocking)
   static unsigned long lastBatCheck = 0;
@@ -360,17 +687,49 @@ void loop(){
     lastBatCheck = now;
     float v = readBatteryVoltage();
     Serial.print("Battery: "); Serial.println(v);
-    if (v < LOW_BATT_THRESHOLD) {
-      // low battery warning: blink LED faster
-      for (int i=0;i<2;i++){
-        digitalWrite(PIN_LED, HIGH); delay(60);
-        digitalWrite(PIN_LED, LOW);  delay(60);
+    // Broadcast battery voltage over UDP for desktop app (header 0xB0)
+    if (useWiFiMouse) {
+      uint16_t mv = (uint16_t)(v * 1000.0f + 0.5f); // millivolts approx
+      uint8_t pct = voltageToPercent(v);
+      uint8_t pkt[5];
+      pkt[0] = 0xB0;           // battery packet header
+      pkt[1] = udp_seq++;      // sequence
+      pkt[2] = (uint8_t)(mv & 0xFF);
+      pkt[3] = (uint8_t)((mv >> 8) & 0xFF);
+      pkt[4] = pct;            // percent (0..100)
+      udp.beginPacket("255.255.255.255", UDP_PORT);
+      udp.write(pkt, sizeof(pkt));
+      udp.endPacket();
+    }
+    // Non-blocking low-battery LED blink
+    static bool lowBlink = false;
+    static unsigned long lastBlink = 0;
+    if (v < LOW_BATT_THRESHOLD && eventBlinkEnd == 0) {
+      if (now - lastBlink > 120) {
+        lastBlink = now;
+        lowBlink = !lowBlink;
+        digitalWrite(PIN_LED, lowBlink ? HIGH : LOW);
       }
     }
   }
 
   // Small yield to background tasks
   delay(0);
+
+  // Service event blink (non-blocking confirmation)
+  if (eventBlinkEnd) {
+    if (now < eventBlinkEnd) {
+      if (now - eventBlinkLast > 100) {
+        eventBlinkLast = now;
+        eventBlinkOn = !eventBlinkOn;
+        digitalWrite(PIN_LED, eventBlinkOn ? HIGH : LOW);
+      }
+    } else {
+      eventBlinkEnd = 0;
+      eventBlinkOn = false;
+      digitalWrite(PIN_LED, LOW);
+    }
+  }
 }
 
 // ---- Utility functions ----
@@ -382,6 +741,18 @@ float applyDeadzone(float valDeg, float dead) {
   return valDeg > 0 ? (valDeg - dead) : (valDeg + dead);
 }
 
+// Soft deadzone with smooth cubic transition to avoid a hard step at the threshold
+float softDeadzone(float x, float dead, float width) {
+  float ax = fabs(x);
+  if (ax <= dead) return 0.0f;
+  float sign = (x >= 0) ? 1.0f : -1.0f;
+  if (ax >= dead + width) return sign * (ax - dead);
+  // In the transition band [dead, dead+width], ease-in with cubic (Hermite)
+  float u = (ax - dead) / width; // 0..1
+  float eased = u * u * (3.0f - 2.0f * u); // smoothstep
+  return sign * eased * (ax - dead);
+}
+
 float mapTiltToSpeed(float tiltDeg, float sens) {
   // Map tilt degrees to pixels per loop step. Exponential mapping gives finer low-end control
   float sign = (tiltDeg >= 0) ? 1.0f : -1.0f;
@@ -389,6 +760,14 @@ float mapTiltToSpeed(float tiltDeg, float sens) {
   // A curve: speed = k * (mag^1.5)
   float k = sens * 0.08f; // tune this
   float speed = k * pow(mag, 1.5f);
+  return sign * speed;
+}
+
+// Simple stable non-linear mapping
+float mapTiltToSpeedSimple(float tiltDeg, float sens, float gammaExp) {
+  float sign = (tiltDeg >= 0) ? 1.0f : -1.0f;
+  float mag = fabs(tiltDeg);
+  float speed = sens * 0.06f * pow(mag, gammaExp);
   return sign * speed;
 }
 
@@ -448,20 +827,24 @@ void sendBrowserBack() {
   Serial.println("Gesture: BACK");
   // Some BleMouse implementations support back/forward
   // If not supported, you can send keyboard shortcuts (Alt+Left, etc.). Here we try mouse extra buttons:
+#if USE_BLE_MOUSE
   if (bleMouse.isConnected()) {
     bleMouse.press(MOUSE_BACK);
     delay(50);
     bleMouse.release(MOUSE_BACK);
   }
+#endif
 }
 
 void sendBrowserForward() {
   Serial.println("Gesture: FORWARD");
+#if USE_BLE_MOUSE
   if (bleMouse.isConnected()) {
     bleMouse.press(MOUSE_FORWARD);
     delay(50);
     bleMouse.release(MOUSE_FORWARD);
   }
+#endif
 }
 
 float readBatteryVoltage() {
@@ -472,6 +855,62 @@ float readBatteryVoltage() {
   float v_adc = (raw / adcMax) * ADC_REF;
   float batteryV = v_adc * VOLT_DIVIDER_RATIO;
   return batteryV;
+}
+
+// Improved LiPo single-cell SoC approximation for a typical 3.7V (1S) cell.
+// Based on a blended rest/discharge curve (light load). Voltage under load will sag;
+// treat this as an estimate. Below ~3.50V we rapidly approach empty; above 4.20V clamp.
+// If you routinely measure under higher load, consider adding IR compensation.
+uint8_t voltageToPercent(float v) {
+  // Hard clamps
+  if (v <= 3.50f) return 0;   // treat <3.50V as effectively empty to protect the cell
+  if (v >= 4.20f) return 100;
+  // Table of (voltage, percent). We'll interpolate between nearest lower & upper points.
+  struct VP { float vv; uint8_t pp; };
+  static const VP curve[] = {
+    //   V      %
+    {3.50f,  0},
+    {3.55f,  3},
+    {3.58f,  6},
+    {3.60f,  9},
+    {3.63f, 12},
+    {3.66f, 16},
+    {3.69f, 20},
+    {3.71f, 24},
+    {3.73f, 28},
+    {3.75f, 33},
+    {3.78f, 38},
+    {3.80f, 43},
+    {3.83f, 49},
+    {3.85f, 54},
+    {3.87f, 58},
+    {3.89f, 62},
+    {3.91f, 66},
+    {3.94f, 70},
+    {3.96f, 73},
+    {3.98f, 76},
+    {4.00f, 80},
+    {4.03f, 84},
+    {4.06f, 88},
+    {4.09f, 92},
+    {4.12f, 95},
+    {4.15f, 97},
+    {4.18f, 99},
+    {4.20f,100}
+  };
+  // Find segment
+  const int N = sizeof(curve)/sizeof(curve[0]);
+  for (int i = 1; i < N; ++i) {
+    if (v <= curve[i].vv) {
+      float v0 = curve[i-1].vv, v1 = curve[i].vv;
+      uint8_t p0 = curve[i-1].pp, p1 = curve[i].pp;
+      float t = (v - v0) / (v1 - v0);
+      float pf = p0 + t * (p1 - p0);
+      if (pf < 0) pf = 0; if (pf > 100) pf = 100;
+      return (uint8_t)(pf + 0.5f);
+    }
+  }
+  return 0; // fallback (should not reach due to clamps)
 }
 
 // Read WHO_AM_I (0x75) from MPU6050 at default address 0x68
@@ -514,4 +953,129 @@ uint8_t readRegisterEndThenRequest(uint8_t devaddr, uint8_t reg) {
   Wire.requestFrom((int)devaddr, 1);
   if (Wire.available()) return Wire.read();
   return 0xFF;
+}
+
+// ---- Calibration helpers ----
+
+bool loadCalibration(float &outPitchOff, float &outRollOff) {
+  if (!prefs.isKey("cal_pitch") || !prefs.isKey("cal_roll")) return false;
+  outPitchOff = prefs.getFloat("cal_pitch", 0.0f);
+  outRollOff  = prefs.getFloat("cal_roll", 0.0f);
+  // Basic sanity: offsets within +/- 30 degrees
+  if (fabs(outPitchOff) > 30.0f || fabs(outRollOff) > 30.0f) return false;
+  return true;
+}
+
+void saveCalibration(float pitchOff, float rollOff) {
+  prefs.putFloat("cal_pitch", pitchOff);
+  prefs.putFloat("cal_roll", rollOff);
+}
+
+void runCalibrationInteractive() {
+  Serial.println("Orientation calibration: keep device at natural neutral position and still...");
+  const unsigned long CAL_MS = 2500;
+  unsigned long start = millis();
+  // Simple averaging; if large movement detected, extend window slightly
+  float sumP = 0, sumR = 0; int n = 0;
+  float lastP = mpu.getAngleX();
+  float lastR = mpu.getAngleY();
+  float moveAccum = 0;
+  while (millis() - start < CAL_MS) {
+    mpu.update();
+    float p = mpu.getAngleX();
+    float r = mpu.getAngleY();
+    sumP += p; sumR += r; n++;
+    moveAccum += fabs(p - lastP) + fabs(r - lastR);
+    lastP = p; lastR = r;
+    digitalWrite(PIN_LED, (millis() / 100) % 2);
+    delay(10);
+  }
+  // If moved too much, warn but proceed
+  if (moveAccum > 50.0f) {
+    Serial.print("Calibration detected motion (score="); Serial.print(moveAccum); Serial.println("). Results may be less accurate.");
+  }
+  float offP = (n > 0) ? (sumP / n) : 0.0f;
+  float offR = (n > 0) ? (sumR / n) : 0.0f;
+  pitchOffset = offP; rollOffset = offR;
+  saveCalibration(pitchOffset, rollOffset);
+  Serial.print("Saved calibration: pitchOff="); Serial.print(pitchOffset);
+  Serial.print(" rollOff="); Serial.println(rollOffset);
+  digitalWrite(PIN_LED, LOW);
+}
+
+// Allow live zeroing: when the user holds all three buttons for ~1s, set current orientation as zero (pitch/roll)
+void checkLiveZeroing(float curPitch, float curRoll, unsigned long now) {
+  static unsigned long tripleStart = 0;
+  static unsigned long pairLRStart = 0;
+  static unsigned long pairRBStart = 0;
+  static unsigned long pairLBStart = 0;
+  bool left = (digitalRead(PIN_LEFT_BTN) == LOW);
+  bool right = (digitalRead(PIN_RIGHT_BTN) == LOW);
+  bool back = (digitalRead(PIN_BACK_BTN) == LOW);
+
+  // Triple: live zero
+  if (left && right && back) {
+    if (tripleStart == 0) tripleStart = now;
+    if (now - tripleStart > 900) {
+      pitchOffset = curPitch;
+      rollOffset  = curRoll;
+      saveCalibration(pitchOffset, rollOffset);
+      Serial.println("Live zero set: current orientation -> 0,0");
+      eventBlinkEnd = now + 400; // short confirmation blink
+      tripleStart = now + 60000; // prevent immediate retrigger
+    }
+  } else {
+    tripleStart = 0;
+  }
+
+  // Pairs: mapping toggles (guarded so they don't trigger during triple)
+  if (!back && left && right) {
+    if (pairLRStart == 0) pairLRStart = now;
+    if (now - pairLRStart > 900) {
+      invertX = !invertX; saveMappingSettings();
+      Serial.print("InvertX toggled -> "); Serial.println(invertX);
+      eventBlinkEnd = now + 400;
+      pairLRStart = now + 60000;
+    }
+  } else {
+    pairLRStart = 0;
+  }
+
+  if (!left && right && back) {
+    if (pairRBStart == 0) pairRBStart = now;
+    if (now - pairRBStart > 900) {
+      invertY = !invertY; saveMappingSettings();
+      Serial.print("InvertY toggled -> "); Serial.println(invertY);
+      eventBlinkEnd = now + 400;
+      pairRBStart = now + 60000;
+    }
+  } else {
+    pairRBStart = 0;
+  }
+
+  if (!right && left && back) {
+    if (pairLBStart == 0) pairLBStart = now;
+    if (now - pairLBStart > 900) {
+      swapXY = !swapXY; saveMappingSettings();
+      Serial.print("SwapXY toggled -> "); Serial.println(swapXY);
+      eventBlinkEnd = now + 400;
+      pairLBStart = now + 60000;
+    }
+  } else {
+    pairLBStart = 0;
+  }
+}
+
+bool loadMappingSettings() {
+  if (!prefs.isKey("invX")) { return false; }
+  invertX = prefs.getBool("invX", false);
+  invertY = prefs.getBool("invY", false);
+  swapXY  = prefs.getBool("swXY", false);
+  return true;
+}
+
+void saveMappingSettings() {
+  prefs.putBool("invX", invertX);
+  prefs.putBool("invY", invertY);
+  prefs.putBool("swXY", swapXY);
 }

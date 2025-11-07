@@ -1,0 +1,7 @@
+Platform: Windows-10-10.0.26100-SP0
+Python: 3.10.11 (tags/v3.10.11:7d4cc5a, Apr  5 2023, 00:38:17) [MSC v.1929 64 bit (AMD64)]
+bleak: unknown
+Scan found 3 device(s)
+- QCY Watch GT-1965 [78:02:B7:1F:19:65] RSSI=None metadata=None
+- oraimo Watch 5 Lite_28EA [2D:BF:61:DC:28:EA] RSSI=None metadata=None
+- <unknown> [44:14:5D:D2:B1:D0] RSSI=None metadata=None
