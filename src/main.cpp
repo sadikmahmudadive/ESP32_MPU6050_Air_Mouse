@@ -98,6 +98,7 @@ float readBatteryVoltage();
 uint8_t voltageToPercent(float v);
 void sendBrowserBack();
 void sendBrowserForward();
+void sendKeyPacket(uint8_t keyId); // presentation key packet (Wi-Fi)
 void i2cScan();
 uint8_t readWhoAmI();
 uint8_t readRegisterNoRestart(uint8_t devaddr, uint8_t reg);
@@ -199,6 +200,16 @@ bool prevBackPressed = false;
 unsigned long rightPressStartMs = 0;
 unsigned long leftPressStartMs = 0;
 bool leftHoldDragging = false;
+
+// Presentation control state
+bool presentationStarted = false; // first single tap starts presentation (F5)
+unsigned long lastBackTapMs = 0;  // time of last back single tap
+const unsigned long DOUBLE_TAP_WINDOW_MS = 400; // within this window a second tap -> double tap (previous slide)
+bool pendingSingleBack = false;  // awaiting possible second tap
+// Long press end presentation
+unsigned long backHoldStartMs = 0;
+bool escHoldTriggered = false;
+const unsigned long BACK_LONG_PRESS_MS = 1200;
 
 // Debounce state for buttons
 const unsigned long DEBOUNCE_MS = 50; // ms
@@ -521,12 +532,43 @@ void loop(){
     prevLeftPressed = leftPressed;
 
     if (backPressed && !prevBackPressed) {
-      unsigned long since = now - lastBackClickMs;
-      float moveSpeed = sqrt(smoothed_dx*smoothed_dx + smoothed_dy*smoothed_dy);
-      if (since >= MIN_CLICK_INTERVAL_MS && moveSpeed <= CLICK_MOVE_THRESHOLD) {
-        sendMousePacket(0,0,0x04);
-        lastBackClickMs = now;
+      // Back button tap for presentation control
+      unsigned long sinceLastTap = now - lastBackTapMs;
+      lastBackTapMs = now;
+      if (pendingSingleBack && sinceLastTap <= DOUBLE_TAP_WINDOW_MS) {
+        // Double tap -> previous slide (Left Arrow)
+        pendingSingleBack = false;
+        sendKeyPacket(3); // left
+      } else {
+        // Start new tap sequence
+        pendingSingleBack = true;
       }
+      // Start hold timing
+      backHoldStartMs = now;
+      escHoldTriggered = false;
+    }
+    if (backPressed) {
+      // Check for long press to end presentation
+      if (backHoldStartMs && presentationStarted && !escHoldTriggered && (now - backHoldStartMs) > BACK_LONG_PRESS_MS) {
+        sendKeyPacket(4); // Esc end presentation
+        presentationStarted = false;
+        escHoldTriggered = true;
+        pendingSingleBack = false; // cancel pending single tap
+      }
+    } else {
+      backHoldStartMs = 0;
+      escHoldTriggered = false;
+    }
+    // Resolve pending single tap if window expired
+    if (pendingSingleBack && (now - lastBackTapMs) > DOUBLE_TAP_WINDOW_MS) {
+      // Single tap action
+      if (!presentationStarted) {
+        sendKeyPacket(1); // F5 start presentation
+        presentationStarted = true;
+      } else {
+        sendKeyPacket(2); // right (next slide)
+      }
+      pendingSingleBack = false;
     }
     prevBackPressed = backPressed;
 
@@ -607,20 +649,37 @@ void loop(){
     }
     prevLeftPressed = leftPressed;
 
-    // Back button: momentary click on press
+    // Back button presentation control (BLE path simplified to Wi-Fi packet send for host handling)
     if (backPressed && !prevBackPressed) {
-      // throttle/back movement guard
-      unsigned long since = now - lastBackClickMs;
-      float moveSpeed = sqrt(smoothed_dx*smoothed_dx + smoothed_dy*smoothed_dy);
-        if (since >= MIN_CLICK_INTERVAL_MS && moveSpeed <= CLICK_MOVE_THRESHOLD) {
-          Serial.println("Button: BACK click");
-          if (useWiFiMouse) sendMousePacket(0,0,0x04);
-          else bleMouse.click(MOUSE_BACK);
-          lastBackClickMs = now;
+      unsigned long sinceLastTap = now - lastBackTapMs;
+      lastBackTapMs = now;
+      if (pendingSingleBack && sinceLastTap <= DOUBLE_TAP_WINDOW_MS) {
+        pendingSingleBack = false;
+        sendKeyPacket(3); // previous slide
       } else {
-        Serial.print("BACK click suppressed: dt="); Serial.print(since);
-        Serial.print("ms move="); Serial.println(moveSpeed);
+        pendingSingleBack = true;
       }
+      backHoldStartMs = now;
+      escHoldTriggered = false;
+    }
+    if (backPressed) {
+      if (backHoldStartMs && presentationStarted && !escHoldTriggered && (now - backHoldStartMs) > BACK_LONG_PRESS_MS) {
+        sendKeyPacket(4); // Esc end presentation
+        presentationStarted = false;
+        escHoldTriggered = true;
+        pendingSingleBack = false;
+      }
+    } else {
+      backHoldStartMs = 0;
+      escHoldTriggered = false;
+    }
+    if (pendingSingleBack && (now - lastBackTapMs) > DOUBLE_TAP_WINDOW_MS) {
+      if (!presentationStarted) {
+        sendKeyPacket(1); presentationStarted = true; // start show
+      } else {
+        sendKeyPacket(2); // next slide
+      }
+      pendingSingleBack = false;
     }
     prevBackPressed = backPressed;
 
@@ -845,6 +904,21 @@ void sendBrowserForward() {
     bleMouse.release(MOUSE_FORWARD);
   }
 #endif
+}
+
+// Send a presentation key packet over UDP: header 0xC0, seq, keyId
+// keyId: 1=F5(start), 2=RIGHT(next), 3=LEFT(previous), 4=ESC(end presentation)
+void sendKeyPacket(uint8_t keyId) {
+  if (!useWiFiMouse) return; // only via Wi-Fi
+  uint8_t pkt[4];
+  pkt[0] = 0xC0; // key packet header
+  pkt[1] = udp_seq++;
+  pkt[2] = keyId;
+  pkt[3] = 0; // reserved
+  udp.beginPacket("255.255.255.255", UDP_PORT);
+  udp.write(pkt, sizeof(pkt));
+  udp.endPacket();
+  Serial.print("Key packet sent id="); Serial.println(keyId);
 }
 
 float readBatteryVoltage() {

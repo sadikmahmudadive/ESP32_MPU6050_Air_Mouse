@@ -32,6 +32,7 @@ class UdpListener(QThread):
     logSignal = Signal(str)
     batterySignal = Signal(float, int)  # volts, percent
     packetSignal = Signal(int, int, int, int, str)  # seq, dx, dy, buttons, sender
+    keySignal = Signal(int)  # keyId: 1=F5,2=RIGHT,3=LEFT
 
     def __init__(self, port: int, parent=None):
         super().__init__(parent)
@@ -72,6 +73,12 @@ class UdpListener(QThread):
                 dy = int.from_bytes(data[3:4], 'little', signed=True)
                 buttons = data[4]
                 self.packetSignal.emit(seq, dx, dy, buttons, addr[0])
+                continue
+            # Key packet (0xC0): 0xC0, seq, keyId, 0
+            if len(data) >= 3 and data[0] == 0xC0:
+                keyId = int(data[2])
+                self.keySignal.emit(keyId)
+                continue
         try:
             sock.close()
         except Exception:
@@ -94,6 +101,7 @@ class MainWindow(QMainWindow):
         self.udp_port = 5555
         self.recenter_edges = True
         self.edge_margin = 2
+        self.show_batt_percent = True  # toggle: True -> show percent, False -> show volts
 
         self._load_settings()
 
@@ -160,6 +168,11 @@ class MainWindow(QMainWindow):
         dv.addLayout(dtop)
         self.log_box = QTextEdit(); self.log_box.setReadOnly(True)
         dv.addWidget(self.log_box)
+        # Toast label for key events
+        self.toast_label = QLabel("")
+        self.toast_label.setStyleSheet("color:#fff;background:#444;padding:4px;border-radius:4px;")
+        self.toast_label.setVisible(False)
+        dv.addWidget(self.toast_label)
 
         # BLE tab
         ble_tab = QWidget(); tabs.addTab(ble_tab, "BLE")
@@ -190,6 +203,10 @@ class MainWindow(QMainWindow):
         self.recenter_cb = QCheckBox("Recenter at edges (avoid boundary lock)"); self.recenter_cb.setChecked(self.recenter_edges)
         self.recenter_cb.stateChanged.connect(self.on_recenter_toggle)
         sv.addWidget(self.recenter_cb)
+        self.batt_toggle_cb = QCheckBox("Show battery percent (uncheck to show volts)")
+        self.batt_toggle_cb.setChecked(self.show_batt_percent)
+        self.batt_toggle_cb.stateChanged.connect(self.on_batt_toggle)
+        sv.addWidget(self.batt_toggle_cb)
         sv.addStretch(1)
 
         self.setCentralWidget(central)
@@ -209,6 +226,7 @@ class MainWindow(QMainWindow):
                 data = json.load(f)
             self.udp_port = int(data.get('udp_port', self.udp_port))
             self.recenter_edges = bool(data.get('recenter_edges', self.recenter_edges))
+            self.show_batt_percent = bool(data.get('show_batt_percent', self.show_batt_percent))
         except Exception:
             pass
 
@@ -217,6 +235,7 @@ class MainWindow(QMainWindow):
             data = {
                 'udp_port': int(self.udp_port),
                 'recenter_edges': bool(self.recenter_edges),
+                'show_batt_percent': bool(self.show_batt_percent),
             }
             with open(CONFIG_FILE, 'w', encoding='utf-8') as f:
                 json.dump(data, f, indent=2)
@@ -289,6 +308,7 @@ class MainWindow(QMainWindow):
             self.udp_thread.logSignal.connect(self.log)
             self.udp_thread.batterySignal.connect(self.on_battery)
             self.udp_thread.packetSignal.connect(self.on_packet)
+            self.udp_thread.keySignal.connect(self.on_key)
             self.udp_thread.start()
             self.listen_btn.setText("Stop Wi‑Fi listener")
             self.log(f"Started UDP listener on port {self.udp_port}")
@@ -316,9 +336,14 @@ class MainWindow(QMainWindow):
         self.recenter_edges = (state == Qt.Checked)
         self._save_settings()
 
+    def on_batt_toggle(self, state):
+        self.show_batt_percent = (state == Qt.Checked)
+        self._save_settings()
+        self.gl_widget.update()
+
     # Packet handlers
     def on_battery(self, volts: float, pct: int):
-        self.batt_label.setText(f"{volts:.2f} V {pct if pct>=0 else 0}%")
+        # Update stored values first
         self.batt_volts = volts; self.batt_pct = pct
         if pct >= 0:
             self.batt_bar.setValue(pct)
@@ -344,6 +369,11 @@ class MainWindow(QMainWindow):
                         break
             self.batt_bar.setValue(est_pct)
             pct = est_pct
+        # Update label depending on toggle
+        if self.show_batt_percent:
+            self.batt_label.setText(f"{pct}%")
+        else:
+            self.batt_label.setText(f"{volts:.2f} V")
         self.log(f"Battery: {volts:.2f}V {pct}%")
         self.gl_widget.update()
 
@@ -399,6 +429,40 @@ class MainWindow(QMainWindow):
         # Record motion for GL
         self.motion_hist.append((dx, dy))
         self.gl_widget.update()
+
+    # Key packet handler: inject presentation keys
+    def on_key(self, keyId: int):
+        # keyId: 1=F5(start), 2=RIGHT(next), 3=LEFT(prev)
+        if not PYNPUT_AVAILABLE:
+            self.log("pynput not available: cannot inject keys")
+            return
+        try:
+            from pynput.keyboard import Controller as KbController, Key
+            kb = KbController()
+            if keyId == 1:
+                # F5 to start presentation (PowerPoint/Keynote; for Google Slides use F5 or Ctrl+F5 depending)
+                kb.press(Key.f5); kb.release(Key.f5)
+                self._show_toast("Presentation: START (F5)")
+            elif keyId == 2:
+                kb.press(Key.right); kb.release(Key.right)
+                self._show_toast("Presentation: NEXT")
+            elif keyId == 3:
+                kb.press(Key.left); kb.release(Key.left)
+                self._show_toast("Presentation: PREV")
+            elif keyId == 4:
+                kb.press(Key.esc); kb.release(Key.esc)
+                self._show_toast("Presentation: END (Esc)")
+            else:
+                self.log(f"Unknown keyId {keyId}")
+        except Exception as e:
+            self.log(f"Key inject failed: {e}")
+
+    def _show_toast(self, text: str):
+        self.toast_label.setText(text)
+        self.toast_label.setVisible(True)
+        self.toast_label.setStyleSheet("color:#fff;background:#333;padding:4px 8px;border-radius:6px;font-weight:500;")
+        # Auto hide after 1.5s
+        QtCore.QTimer.singleShot(1500, lambda: self.toast_label.setVisible(False))
 
     # BLE (basic scan/connect — Windows note: OS may auto-claim HID; this is for diagnostics)
     def ble_scan(self):
@@ -521,26 +585,50 @@ class VisualWidget(QOpenGLWidget):
             glVertex2f(x, y)
         glEnd()
 
-        # Battery gauge (right side vertical bar)
+        # Battery gauge (right side vertical bar) with gradient + low battery blink
         volts = self.main.batt_volts
         pct = self.main.batt_pct if self.main.batt_pct >= 0 else 0
         bw, bh = 24, int(h*0.6)
         bx, by = w - 40, (h - bh)//2
-        glColor3f(0.45, 0.45, 0.45)
+        # Outline
+        glColor3f(0.55, 0.55, 0.55)
         glBegin(GL_LINE_LOOP)
         glVertex2f(bx, by)
         glVertex2f(bx+bw, by)
         glVertex2f(bx+bw, by+bh)
         glVertex2f(bx, by+bh)
         glEnd()
+        # Compute gradient color (red->yellow->green)
+        # Red (0%) -> Yellow (50%) -> Green (100%)
+        rR,gR,bR = 0.90,0.15,0.10
+        rY,gY,bY = 0.95,0.75,0.15
+        rG,gG,bG = 0.15,0.85,0.35
+        if pct <= 50:
+            t = pct/50.0
+            cr = rR + t*(rY - rR); cg = gR + t*(gY - gR); cb = bR + t*(bY - bR)
+        else:
+            t = (pct-50)/50.0
+            cr = rY + t*(rG - rY); cg = gY + t*(gG - gY); cb = bY + t*(bG - bY)
+        # Blink below 10%
+        blink_on = True
+        if pct < 10:
+            ms = QtCore.QTime.currentTime().msec() + QtCore.QTime.currentTime().second()*1000
+            blink_on = (ms % 800) < 400
         fill = int((pct/100.0) * (bh-4))
-        glColor3f(0.15, 0.85, 0.35)
-        glBegin(GL_QUADS)
-        glVertex2f(bx+2, by+bh-2)
-        glVertex2f(bx+bw-2, by+bh-2)
-        glVertex2f(bx+bw-2, by+bh-2-fill)
-        glVertex2f(bx+2, by+bh-2-fill)
-        glEnd()
+        if blink_on and fill > 0:
+            glColor3f(cr, cg, cb)
+            glBegin(GL_QUADS)
+            glVertex2f(bx+2, by+bh-2)
+            glVertex2f(bx+bw-2, by+bh-2)
+            glVertex2f(bx+bw-2, by+bh-2-fill)
+            glVertex2f(bx+2, by+bh-2-fill)
+            glEnd()
+        # Optional LOW indicator
+        if pct < 10 and blink_on:
+            painter_low = QtGui.QPainter(self)
+            painter_low.setPen(QtGui.QColor(255,70,70))
+            painter_low.drawText(bx-4, by+bh+14, "LOW")
+            painter_low.end()
         # Text overlay
         painter = QtGui.QPainter(self)
         painter.setPen(QtGui.QColor(220,220,220))
