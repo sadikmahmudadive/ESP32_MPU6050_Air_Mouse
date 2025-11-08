@@ -211,6 +211,28 @@ unsigned long backHoldStartMs = 0;
 bool escHoldTriggered = false;
 const unsigned long BACK_LONG_PRESS_MS = 1200;
 
+// --- Raw IMU streaming for ML data collection (Step 1) ---
+// Controlled via UDP control packets: header 0xD2, cmd byte (0x01 start, 0x02 stop)
+bool rawStreaming = false;
+unsigned long lastRawStreamMs = 0;
+const unsigned long RAW_STREAM_INTERVAL_MS = 10; // 100Hz approx
+void sendRawImuPacket(int16_t ax, int16_t ay, int16_t az, int16_t gx, int16_t gy, int16_t gz) {
+  if (!useWiFiMouse) return; // only via Wi-Fi
+  uint8_t pkt[14];
+  pkt[0] = 0xD0; // raw IMU header
+  pkt[1] = udp_seq++;
+  // Little endian write
+  pkt[2] = ax & 0xFF; pkt[3] = (ax >> 8) & 0xFF;
+  pkt[4] = ay & 0xFF; pkt[5] = (ay >> 8) & 0xFF;
+  pkt[6] = az & 0xFF; pkt[7] = (az >> 8) & 0xFF;
+  pkt[8] = gx & 0xFF; pkt[9] = (gx >> 8) & 0xFF;
+  pkt[10] = gy & 0xFF; pkt[11] = (gy >> 8) & 0xFF;
+  pkt[12] = gz & 0xFF; pkt[13] = (gz >> 8) & 0xFF;
+  udp.beginPacket("255.255.255.255", UDP_PORT);
+  udp.write(pkt, sizeof(pkt));
+  udp.endPacket();
+}
+
 // Debounce state for buttons
 const unsigned long DEBOUNCE_MS = 50; // ms
 bool lastRawLeft = false, lastRawRight = false, lastRawBack = false;
@@ -408,11 +430,48 @@ void loop(){
   unsigned long dt_ms = now - lastLoop;
   lastLoop = now;
 
+  // --- Control packet handling (0xD2) for ML streaming start/stop ---
+  int ctrlSize = udp.parsePacket();
+  if (ctrlSize > 0) {
+    uint8_t cbuf[8];
+    int rlen = udp.read(cbuf, sizeof(cbuf));
+    if (rlen >= 2 && cbuf[0] == 0xD2) {
+      uint8_t cmd = cbuf[1];
+      if (cmd == 0x01) {
+        rawStreaming = true;
+        Serial.println("Raw IMU streaming ENABLED");
+      } else if (cmd == 0x02) {
+        rawStreaming = false;
+        Serial.println("Raw IMU streaming DISABLED");
+      }
+    }
+  }
+
   // Use MPU6050_tockn DMP update to get angles
   mpu.update();
   float newPitch = mpu.getAngleX();
   float newRoll  = mpu.getAngleY();
   float newYaw   = mpu.getAngleZ();
+
+  // Raw sensor values (library provides accel (g) & gyro (deg/s)) for ML streaming.
+  // Scale to int16: accel(g)*1000 -> mg, gyro(deg/s)*100 -> centi-deg/s.
+  float aXf = mpu.getAccX();
+  float aYf = mpu.getAccY();
+  float aZf = mpu.getAccZ();
+  float gXf = mpu.getGyroX();
+  float gYf = mpu.getGyroY();
+  float gZf = mpu.getGyroZ();
+  int16_t ax_i = (int16_t)constrain((int)(aXf * 1000.0f), -32768, 32767);
+  int16_t ay_i = (int16_t)constrain((int)(aYf * 1000.0f), -32768, 32767);
+  int16_t az_i = (int16_t)constrain((int)(aZf * 1000.0f), -32768, 32767);
+  int16_t gx_i = (int16_t)constrain((int)(gXf * 100.0f), -32768, 32767);
+  int16_t gy_i = (int16_t)constrain((int)(gYf * 100.0f), -32768, 32767);
+  int16_t gz_i = (int16_t)constrain((int)(gZf * 100.0f), -32768, 32767);
+
+  if (rawStreaming && (now - lastRawStreamMs) >= RAW_STREAM_INTERVAL_MS) {
+    lastRawStreamMs = now;
+    sendRawImuPacket(ax_i, ay_i, az_i, gx_i, gy_i, gz_i);
+  }
 
   // Compute angular rates (deg/s) from angle deltas
   float dt = dt_ms / 1000.0f;

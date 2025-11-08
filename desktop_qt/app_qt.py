@@ -6,10 +6,17 @@ import platform as py_platform  # alias to avoid clash with OpenGL.platform afte
 import subprocess
 from datetime import datetime
 from threading import Event
+import time
+import uuid
+from collections import deque
 
 from PySide6 import QtCore, QtGui, QtWidgets
 from PySide6.QtCore import Qt, Signal, QTimer, QThread
-from PySide6.QtWidgets import QMainWindow, QWidget, QTabWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QLineEdit, QSpinBox, QCheckBox, QProgressBar, QTextEdit, QStatusBar, QMessageBox, QListWidget
+from PySide6.QtWidgets import (
+    QMainWindow, QWidget, QTabWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
+    QLineEdit, QSpinBox, QDoubleSpinBox, QCheckBox, QProgressBar, QTextEdit, QStatusBar, QMessageBox,
+    QListWidget, QPlainTextEdit, QGroupBox, QFormLayout, QRadioButton
+)
 from PySide6.QtOpenGLWidgets import QOpenGLWidget
 from OpenGL.GL import (
     glClearColor, glDisable, glViewport, glMatrixMode, glLoadIdentity, glOrtho,
@@ -28,11 +35,197 @@ except Exception:
 APP_NAME = "ESP Air Mouse — Qt"
 CONFIG_FILE = os.path.join(os.path.dirname(__file__), 'config.json')
 
+# --- Gesture Recorder Implementation ---
+
+class GestureRecorder(QtCore.QObject):
+    """Stateful recorder for automatic gesture segmentation.
+
+    Modes:
+        tap: user triggers each capture manually.
+        auto: motion threshold triggers start and quiet period triggers stop.
+        batch: cycles labels automatically collecting target count.
+    """
+    segmentSaved = Signal(str, str)  # path, label
+    segmentRejected = Signal(str)    # reason
+    progressUpdated = Signal(dict)   # label->count mapping
+    activeLabelChanged = Signal(str)
+    statusMessage = Signal(str)
+
+    def __init__(self, base_dir: str, sampling_hz: int = 100, window_len_s: float = 1.0,
+                 pre_roll_s: float = 0.25, post_roll_s: float = 0.25,
+                 accel_thresh_g: float = 1.2, gyro_thresh_dps: float = 120.0,
+                 quiet_ms: int = 200, target_per_label: int = 30, parent=None):
+        super().__init__(parent)
+        self.base_dir = base_dir
+        os.makedirs(self.base_dir, exist_ok=True)
+        self.sampling_hz = sampling_hz
+        self.window_len_s = window_len_s
+        self.pre_roll_s = pre_roll_s
+        self.post_roll_s = post_roll_s
+        self.accel_thresh_g = accel_thresh_g
+        self.gyro_thresh_dps = gyro_thresh_dps
+        self.quiet_ms = quiet_ms
+        self.target_per_label = target_per_label
+        # dynamic state
+        self.mode = 'tap'
+        self.labels = []
+        self.active_label = None
+        self.label_counts = {}
+        self.ring = deque(maxlen=int((window_len_s + pre_roll_s + post_roll_s) * sampling_hz * 3))
+        self.capturing = False
+        self.capture_start_index = None
+        self.last_motion_ms = None
+        self.quiet_start_ms = None
+        self.batch_index = 0
+        self.segment_seq = 0
+        self.auto_enabled = False
+        self.batch_enabled = False
+        self.streaming_active = False  # external (firmware) streaming
+
+    # --- Session control ---
+    def start_session(self, labels: list[str], mode: str = 'tap'):
+        if not labels:
+            self.statusMessage.emit("No labels provided; session aborted.")
+            return
+        self.labels = list(dict.fromkeys([l.strip() for l in labels if l.strip()]))  # dedupe preserve order
+        self.label_counts = {l: 0 for l in self.labels}
+        self.mode = mode
+        self.batch_enabled = (mode == 'batch')
+        self.auto_enabled = (mode == 'auto') or self.batch_enabled
+        self.batch_index = 0
+        self.set_active_label(self.labels[0])
+        self.segment_seq = 0
+        self.statusMessage.emit(f"Session started in {self.mode} mode. Labels: {', '.join(self.labels)}")
+        self.progressUpdated.emit(self.label_counts.copy())
+
+    def stop_session(self):
+        self.capturing = False
+        self.statusMessage.emit("Session stopped.")
+
+    def set_active_label(self, label: str):
+        if label not in self.label_counts:
+            return
+        self.active_label = label
+        self.activeLabelChanged.emit(label)
+
+    def next_label(self):
+        if not self.labels:
+            return
+        self.batch_index = (self.batch_index + 1) % len(self.labels)
+        self.set_active_label(self.labels[self.batch_index])
+
+    # --- Sample ingestion ---
+    def feed_sample(self, ts_ms: int, ax: int, ay: int, az: int, gx: int, gy: int, gz: int):
+        # Convert raw to engineering units (approx). Assuming accel raw ~ LSB per mg? Keep raw for now.
+        self.ring.append((ts_ms, ax, ay, az, gx, gy, gz))
+        if self.auto_enabled:
+            self._auto_state_machine()
+
+    # --- Manual trigger (tap) ---
+    def manual_trigger(self):
+        if self.active_label is None:
+            self.statusMessage.emit("Set a label first.")
+            return
+        self._start_capture()
+        # schedule finalize after window length + post roll
+        QtCore.QTimer.singleShot(int((self.window_len_s + self.post_roll_s)*1000), self._finalize_capture)
+
+    # --- Auto motion logic ---
+    def _auto_state_machine(self):
+        if self.active_label is None:
+            return
+        # Compute accel magnitude & gyro magnitude (simple)
+        window = list(self.ring)[-1:]
+        if not window:
+            return
+        ts_ms, ax, ay, az, gx, gy, gz = window[0]
+        a_mag = (ax**2 + ay**2 + az**2) ** 0.5
+        g_mag = (gx**2 + gy**2 + gz**2) ** 0.5
+        now = ts_ms
+        motion = (a_mag > self.accel_thresh_g*16384) or (g_mag > self.gyro_thresh_dps*131)  # assuming MPU6050 scale factors
+        if motion:
+            self.last_motion_ms = now
+            self.quiet_start_ms = None
+            if not self.capturing:
+                self._start_capture()
+        else:
+            if self.capturing:
+                if self.quiet_start_ms is None:
+                    self.quiet_start_ms = now
+                elif now - self.quiet_start_ms >= self.quiet_ms:
+                    self._finalize_capture()
+
+    # --- Capture control ---
+    def _start_capture(self):
+        if self.capturing:
+            return
+        self.capturing = True
+        self.capture_start_index = len(self.ring) - 1  # index of last sample when started
+        self.statusMessage.emit(f"Capture started for {self.active_label}")
+
+    def _finalize_capture(self):
+        if not self.capturing:
+            return
+        self.capturing = False
+        # Determine slice indices
+        if not self.ring:
+            self.segmentRejected.emit("Empty ring buffer")
+            return
+        end_index = len(self.ring) - 1
+        # Pre-roll samples
+        pre_samples = int(self.pre_roll_s * self.sampling_hz)
+        post_samples = int(self.post_roll_s * self.sampling_hz)
+        start_index = max(0, self.capture_start_index - pre_samples)
+        slice_samples = list(self.ring)[start_index:end_index + 1 + post_samples]
+        # Quality checks
+        if len(slice_samples) < int(self.window_len_s * self.sampling_hz * 0.6):
+            self.segmentRejected.emit("Too short")
+            return
+        # Basic variance check on accel magnitude
+        a_mags = [((ax**2 + ay**2 + az**2) ** 0.5) for (_, ax, ay, az, gx, gy, gz) in slice_samples]
+        if (max(a_mags) - min(a_mags)) < 500:  # raw threshold heuristic
+            self.segmentRejected.emit("Low variance")
+            return
+        # Save segment CSV
+        ts_str = datetime.now().strftime('%Y%m%d_%H%M%S')
+        seg_id = uuid.uuid4().hex[:8]
+        self.segment_seq += 1
+        fname = f"{self.active_label}_{ts_str}_{seg_id}_{self.segment_seq}.csv"
+        path = os.path.join(self.base_dir, fname)
+        try:
+            with open(path, 'w', encoding='utf-8') as f:
+                f.write("timestamp_ms,ax,ay,az,gx,gy,gz,label,segment_id,sample_index\n")
+                for i,(ts_ms, ax, ay, az, gx, gy, gz) in enumerate(slice_samples):
+                    f.write(f"{ts_ms},{ax},{ay},{az},{gx},{gy},{gz},{self.active_label},{seg_id},{i}\n")
+        except Exception as e:
+            self.segmentRejected.emit(f"File error: {e}")
+            return
+        # Update counts
+        self.label_counts[self.active_label] += 1
+        self.segmentSaved.emit(path, self.active_label)
+        self.progressUpdated.emit(self.label_counts.copy())
+        self.statusMessage.emit(f"Saved segment {path}")
+        # Batch advancement
+        if self.batch_enabled and self.label_counts[self.active_label] >= self.target_per_label:
+            # Advance label or finish
+            remaining = [l for l,c in self.label_counts.items() if c < self.target_per_label]
+            if remaining:
+                # pick next remaining label
+                for l in self.labels:
+                    if self.label_counts[l] < self.target_per_label:
+                        self.set_active_label(l)
+                        break
+            else:
+                self.statusMessage.emit("Batch collection complete.")
+                self.stop_session()
+
+
 class UdpListener(QThread):
     logSignal = Signal(str)
     batterySignal = Signal(float, int)  # volts, percent
     packetSignal = Signal(int, int, int, int, str)  # seq, dx, dy, buttons, sender
     keySignal = Signal(int)  # keyId: 1=F5,2=RIGHT,3=LEFT
+    rawImuSignal = Signal(int, int, int, int, int, int)  # ax,ay,az,gx,gy,gz
 
     def __init__(self, port: int, parent=None):
         super().__init__(parent)
@@ -78,6 +271,19 @@ class UdpListener(QThread):
             if len(data) >= 3 and data[0] == 0xC0:
                 keyId = int(data[2])
                 self.keySignal.emit(keyId)
+                continue
+            # Raw IMU packet (0xD0): 0xD0, seq, ax,ay,az,gx,gy,gz (int16 LE)
+            if len(data) >= 14 and data[0] == 0xD0:
+                def s16(lo, hi):
+                    v = lo | (hi << 8)
+                    return v - 65536 if v & 0x8000 else v
+                ax = s16(data[2], data[3])
+                ay = s16(data[4], data[5])
+                az = s16(data[6], data[7])
+                gx = s16(data[8], data[9])
+                gy = s16(data[10], data[11])
+                gz = s16(data[12], data[13])
+                self.rawImuSignal.emit(ax, ay, az, gx, gy, gz)
                 continue
         try:
             sock.close()
@@ -209,8 +415,110 @@ class MainWindow(QMainWindow):
         sv.addWidget(self.batt_toggle_cb)
         sv.addStretch(1)
 
+        # ML tab (enhanced automatic recorder)
+        ml_tab = QWidget(); tabs.addTab(ml_tab, "ML")
+        mlv = QVBoxLayout(ml_tab)
+
+        # Mode & label area
+        mode_row = QHBoxLayout()
+        self.mode_tap_btn = QRadioButton("Tap")
+        self.mode_auto_btn = QRadioButton("Auto Motion")
+        self.mode_batch_btn = QRadioButton("Batch")
+        self.mode_tap_btn.setChecked(True)
+        mode_row.addWidget(QLabel("Mode:"))
+        mode_row.addWidget(self.mode_tap_btn)
+        mode_row.addWidget(self.mode_auto_btn)
+        mode_row.addWidget(self.mode_batch_btn)
+        mode_row.addStretch(1)
+        mlv.addLayout(mode_row)
+
+        label_row = QHBoxLayout()
+        self.ml_label_edit = QLineEdit(); self.ml_label_edit.setPlaceholderText("active label (e.g. flick_left)")
+        label_row.addWidget(self.ml_label_edit)
+        self.ml_set_label_btn = QPushButton("Set Active")
+        self.ml_set_label_btn.clicked.connect(self._ml_set_label)
+        label_row.addWidget(self.ml_set_label_btn)
+        self.batch_labels_edit = QPlainTextEdit()
+        self.batch_labels_edit.setPlaceholderText("Label list (one per line) for batch mode")
+        self.batch_labels_edit.setFixedHeight(80)
+        mlv.addWidget(self.batch_labels_edit)
+        mlv.addLayout(label_row)
+
+        # Controls row
+        ctrl_row = QHBoxLayout()
+        self.session_start_btn = QPushButton("Start Session")
+        self.session_start_btn.clicked.connect(self._ml_start_session)
+        ctrl_row.addWidget(self.session_start_btn)
+        self.quick_auto_btn = QPushButton("Quick Auto Collect")
+        self.quick_auto_btn.setStyleSheet("font-weight:600")
+        self.quick_auto_btn.clicked.connect(self._ml_quick_auto)
+        ctrl_row.addWidget(self.quick_auto_btn)
+        self.session_stop_btn = QPushButton("Stop Session")
+        self.session_stop_btn.clicked.connect(self._ml_stop_session)
+        ctrl_row.addWidget(self.session_stop_btn)
+        self.tap_capture_btn = QPushButton("Capture (Space)")
+        self.tap_capture_btn.clicked.connect(self._ml_manual_capture)
+        ctrl_row.addWidget(self.tap_capture_btn)
+        ctrl_row.addStretch(1)
+        mlv.addLayout(ctrl_row)
+
+        # Advanced settings
+        adv_box = QGroupBox("Advanced Settings")
+        adv_box.setCheckable(True); adv_box.setChecked(False)
+        form = QFormLayout(adv_box)
+        self.win_len_spin = QDoubleSpinBox(); self.win_len_spin.setRange(0.2, 3.0); self.win_len_spin.setSingleStep(0.1); self.win_len_spin.setValue(1.0)
+        form.addRow("Window (s)", self.win_len_spin)
+        self.pre_roll_spin = QDoubleSpinBox(); self.pre_roll_spin.setRange(0.0, 1.0); self.pre_roll_spin.setSingleStep(0.05); self.pre_roll_spin.setValue(0.25)
+        form.addRow("Pre-roll (s)", self.pre_roll_spin)
+        self.post_roll_spin = QDoubleSpinBox(); self.post_roll_spin.setRange(0.0, 1.0); self.post_roll_spin.setSingleStep(0.05); self.post_roll_spin.setValue(0.25)
+        form.addRow("Post-roll (s)", self.post_roll_spin)
+        self.accel_thresh_spin = QDoubleSpinBox(); self.accel_thresh_spin.setRange(0.2, 5.0); self.accel_thresh_spin.setValue(1.2)
+        form.addRow("Accel thresh (g)", self.accel_thresh_spin)
+        self.gyro_thresh_spin = QDoubleSpinBox(); self.gyro_thresh_spin.setRange(20.0, 1000.0); self.gyro_thresh_spin.setValue(120.0)
+        form.addRow("Gyro thresh (dps)", self.gyro_thresh_spin)
+        self.quiet_ms_spin = QSpinBox(); self.quiet_ms_spin.setRange(50, 2000); self.quiet_ms_spin.setValue(200)
+        form.addRow("Quiet time (ms)", self.quiet_ms_spin)
+        self.target_per_label_spin = QSpinBox(); self.target_per_label_spin.setRange(1, 500); self.target_per_label_spin.setValue(30)
+        form.addRow("Target per label", self.target_per_label_spin)
+        mlv.addWidget(adv_box)
+
+        # Status & progress
+        self.ml_status = QLabel("Session: idle")
+        mlv.addWidget(self.ml_status)
+        self.progress_box = QTextEdit(); self.progress_box.setReadOnly(True); self.progress_box.setFixedHeight(120)
+        mlv.addWidget(self.progress_box)
+        self.ml_note = QLabel("Segments saved under ml_logs/ (one gesture per file). Raw IMU header 0xD0.")
+        nf = self.ml_note.font(); nf.setPointSize(9); self.ml_note.setFont(nf)
+        mlv.addWidget(self.ml_note)
+        mlv.addStretch(1)
+
+        # Instantiate recorder (lazy; created on session start with current params)
+        self.recorder = None
+
         self.setCentralWidget(central)
         self.status = QStatusBar(); self.setStatusBar(self.status)
+
+    # Hotkeys for ML recorder convenience
+    def keyPressEvent(self, event: QtGui.QKeyEvent):
+        key = event.key()
+        if key == Qt.Key_Space:
+            if hasattr(self, 'tap_capture_btn') and self.tap_capture_btn.isEnabled():
+                self._ml_manual_capture()
+                event.accept(); return
+        if key == Qt.Key_Escape:
+            self._ml_stop_session(); event.accept(); return
+        # Numeric label shortcuts (1..9)
+        if Qt.Key_1 <= key <= Qt.Key_9:
+            idx = key - Qt.Key_1
+            if self.recorder and self.recorder.labels:
+                if idx < len(self.recorder.labels):
+                    self.recorder.set_active_label(self.recorder.labels[idx])
+                    event.accept(); return
+        # C to cycle next label
+        if key == Qt.Key_C:
+            if self.recorder:
+                self.recorder.next_label(); event.accept(); return
+        super().keyPressEvent(event)
 
     # Logging helpers
     def log(self, msg: str):
@@ -241,6 +549,123 @@ class MainWindow(QMainWindow):
                 json.dump(data, f, indent=2)
         except Exception:
             pass
+
+    # --- ML logging controls ---
+    # --- New ML recorder handlers ---
+    def _ml_set_label(self):
+        label = self.ml_label_edit.text().strip()
+        if not label:
+            QMessageBox.information(self, "ML", "Enter a label")
+            return
+        if self.recorder:
+            self.recorder.set_active_label(label)
+        self.ml_status.setText(f"Active label: {label}")
+
+    def _ml_start_session(self):
+        mode = 'tap'
+        if self.mode_auto_btn.isChecked():
+            mode = 'auto'
+        elif self.mode_batch_btn.isChecked():
+            mode = 'batch'
+        labels_text = self.batch_labels_edit.toPlainText().strip()
+        labels = [self.ml_label_edit.text().strip()] if mode != 'batch' else [l.strip() for l in labels_text.splitlines() if l.strip()]
+        if mode != 'batch' and not labels[0]:
+            QMessageBox.information(self, "ML", "Set an active label before starting session")
+            return
+        base = os.path.join(os.path.dirname(__file__), 'ml_logs')
+        self.recorder = GestureRecorder(
+            base_dir=base,
+            sampling_hz=100,
+            window_len_s=self.win_len_spin.value(),
+            pre_roll_s=self.pre_roll_spin.value(),
+            post_roll_s=self.post_roll_spin.value(),
+            accel_thresh_g=self.accel_thresh_spin.value(),
+            gyro_thresh_dps=self.gyro_thresh_spin.value(),
+            quiet_ms=self.quiet_ms_spin.value(),
+            target_per_label=self.target_per_label_spin.value()
+        )
+        # Connect recorder signals
+        self.recorder.segmentSaved.connect(self._on_segment_saved)
+        self.recorder.segmentRejected.connect(self._on_segment_rejected)
+        self.recorder.progressUpdated.connect(self._on_progress)
+        self.recorder.activeLabelChanged.connect(self._on_active_label_changed)
+        self.recorder.statusMessage.connect(self._on_recorder_status)
+        self.recorder.start_session(labels, mode)
+        # Ensure UDP listener is running
+        if not (self.udp_thread and self.udp_thread.isRunning()):
+            self.toggle_listener()
+        self._send_stream_cmd(start=True)
+        self.ml_status.setText(f"Session running ({mode})")
+        self.log(f"Recorder session started mode={mode} labels={labels}")
+        # UX: disable tap button in batch/auto
+        self.tap_capture_btn.setEnabled(mode == 'tap')
+
+    def _ml_stop_session(self):
+        if self.recorder:
+            self.recorder.stop_session()
+        self._send_stream_cmd(start=False)
+        self.ml_status.setText("Session: idle")
+
+    def _ml_manual_capture(self):
+        if not self.recorder:
+            QMessageBox.information(self, "ML", "Start a session first")
+            return
+        if self.mode_tap_btn.isChecked():
+            self.recorder.manual_trigger()
+        else:
+            # force finalize if currently capturing
+            if self.recorder.capturing:
+                self.recorder._finalize_capture()
+            else:
+                self.recorder.manual_trigger()
+
+    def _on_segment_saved(self, path: str, label: str):
+        self.log(f"Segment saved: {os.path.basename(path)} label={label}")
+        self._show_toast(f"Saved: {label}")
+
+    def _on_segment_rejected(self, reason: str):
+        self.log(f"Segment rejected: {reason}")
+
+    def _on_progress(self, mapping: dict):
+        lines = [f"{k}: {v}" for k,v in mapping.items()]
+        self.progress_box.setPlainText("\n".join(lines))
+
+    def _on_recorder_status(self, msg: str):
+        self.log("[Recorder] " + msg)
+        if msg:
+            self._show_toast(msg)
+
+    def _on_active_label_changed(self, label: str):
+        self.ml_status.setText(f"Active label: {label}")
+        self.ml_label_edit.setText(label)
+        # Show a concise prompt for the next gesture
+        if self.recorder:
+            count = self.recorder.label_counts.get(label, 0)
+            tgt = self.recorder.target_per_label if self.recorder.batch_enabled else None
+            suffix = f" ({count}/{tgt})" if tgt is not None else ""
+            self._show_toast(f"Do gesture: {label}{suffix}")
+
+    def _ml_quick_auto(self):
+        # One-click: use labels from list, start batch session
+        labels_text = self.batch_labels_edit.toPlainText().strip()
+        labels = [l.strip() for l in labels_text.splitlines() if l.strip()]
+        if not labels:
+            QMessageBox.information(self, "ML", "Enter labels (one per line) in the list, then Quick Auto Collect")
+            return
+        self.mode_batch_btn.setChecked(True)
+        self.ml_label_edit.setText(labels[0])
+        self._ml_start_session()
+
+    def _send_stream_cmd(self, start: bool):
+        cmd = 0x01 if start else 0x02
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+            pkt = bytes([0xD2, cmd])
+            sock.sendto(pkt, ("255.255.255.255", int(self.udp_port)))
+            sock.close()
+        except Exception as e:
+            self.log(f"Failed to send stream cmd {cmd}: {e}")
 
     # Virtual desktop bounds
     def _init_virtual_desktop(self):
@@ -309,6 +734,7 @@ class MainWindow(QMainWindow):
             self.udp_thread.batterySignal.connect(self.on_battery)
             self.udp_thread.packetSignal.connect(self.on_packet)
             self.udp_thread.keySignal.connect(self.on_key)
+            self.udp_thread.rawImuSignal.connect(self.on_raw_imu)
             self.udp_thread.start()
             self.listen_btn.setText("Stop Wi‑Fi listener")
             self.log(f"Started UDP listener on port {self.udp_port}")
@@ -429,6 +855,14 @@ class MainWindow(QMainWindow):
         # Record motion for GL
         self.motion_hist.append((dx, dy))
         self.gl_widget.update()
+    # Raw IMU handler (for logging)
+    def on_raw_imu(self, ax: int, ay: int, az: int, gx: int, gy: int, gz: int):
+        # Feed sample to recorder if active; timestamp in ms monotonic
+        if self.recorder:
+            ts_ms = int(time.time() * 1000)
+            self.recorder.feed_sample(ts_ms, ax, ay, az, gx, gy, gz)
+        # Could add live preview later
+
 
     # Key packet handler: inject presentation keys
     def on_key(self, keyId: int):
