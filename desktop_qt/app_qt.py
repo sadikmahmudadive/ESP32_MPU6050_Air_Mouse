@@ -226,6 +226,7 @@ class UdpListener(QThread):
     packetSignal = Signal(int, int, int, int, str)  # seq, dx, dy, buttons, sender
     keySignal = Signal(int)  # keyId: 1=F5,2=RIGHT,3=LEFT
     rawImuSignal = Signal(int, int, int, int, int, int)  # ax,ay,az,gx,gy,gz
+    provAckSignal = Signal(int, str)  # status, sender
 
     def __init__(self, port: int, parent=None):
         super().__init__(parent)
@@ -271,6 +272,11 @@ class UdpListener(QThread):
             if len(data) >= 3 and data[0] == 0xC0:
                 keyId = int(data[2])
                 self.keySignal.emit(keyId)
+                continue
+            # Provisioning ACK (0xE1): 0xE1, status, seq
+            if len(data) >= 2 and data[0] == 0xE1:
+                status = int(data[1])
+                self.provAckSignal.emit(status, addr[0])
                 continue
             # Raw IMU packet (0xD0): 0xD0, seq, ax,ay,az,gx,gy,gz (int16 LE)
             if len(data) >= 14 and data[0] == 0xD0:
@@ -324,6 +330,9 @@ class MainWindow(QMainWindow):
         self.status_timer = QTimer(self)
         self.status_timer.timeout.connect(self._update_status)
         self.status_timer.start(1000)
+        # Provisioning state
+        self._prov_waiting = False
+        self._prov_deadline = None
 
     def _build_ui(self):
         central = QWidget()
@@ -414,6 +423,33 @@ class MainWindow(QMainWindow):
         self.batt_toggle_cb.stateChanged.connect(self.on_batt_toggle)
         sv.addWidget(self.batt_toggle_cb)
         sv.addStretch(1)
+
+        # Wi-Fi Provisioning tab
+        wifi_tab = QWidget(); tabs.addTab(wifi_tab, "Wi-Fi Setup")
+        wv = QVBoxLayout(wifi_tab)
+        wv.addWidget(QLabel("Push Wi‑Fi credentials to the device over UDP (0xE0). Device must be powered on."))
+        srow = QHBoxLayout()
+        self.scan_btn = QPushButton("Scan Networks")
+        self.scan_btn.clicked.connect(self._wifi_scan)
+        srow.addWidget(self.scan_btn)
+        self.ap_mode_cb = QCheckBox("Direct AP mode")
+        self.ap_mode_cb.setToolTip("Enable to make device host 'ESP-Air-Mouse' AP (password optional)")
+        srow.addWidget(self.ap_mode_cb)
+        srow.addStretch(1)
+        wv.addLayout(srow)
+        box = QGroupBox("Credentials")
+        form = QFormLayout(box)
+        self.ssid_combo = QtWidgets.QComboBox(); self.ssid_combo.setEditable(True)
+        form.addRow("SSID", self.ssid_combo)
+        self.pass_edit = QLineEdit(); self.pass_edit.setEchoMode(QLineEdit.Password)
+        form.addRow("Password", self.pass_edit)
+        self.send_btn = QPushButton("Send & Reboot")
+        self.send_btn.clicked.connect(self._wifi_send)
+        form.addRow(self.send_btn)
+        wv.addWidget(box)
+        self.wifi_status = QLabel("Idle")
+        wv.addWidget(self.wifi_status)
+        wv.addStretch(1)
 
         # ML tab (enhanced automatic recorder)
         ml_tab = QWidget(); tabs.addTab(ml_tab, "ML")
@@ -537,7 +573,6 @@ class MainWindow(QMainWindow):
             self.show_batt_percent = bool(data.get('show_batt_percent', self.show_batt_percent))
         except Exception:
             pass
-
     def _save_settings(self):
         try:
             data = {
@@ -735,6 +770,11 @@ class MainWindow(QMainWindow):
             self.udp_thread.packetSignal.connect(self.on_packet)
             self.udp_thread.keySignal.connect(self.on_key)
             self.udp_thread.rawImuSignal.connect(self.on_raw_imu)
+            # provisioning ACK signal
+            try:
+                self.udp_thread.provAckSignal.connect(self._on_prov_ack)
+            except Exception:
+                pass
             self.udp_thread.start()
             self.listen_btn.setText("Stop Wi‑Fi listener")
             self.log(f"Started UDP listener on port {self.udp_port}")
@@ -748,6 +788,78 @@ class MainWindow(QMainWindow):
         self._save_settings()
         if restart:
             self.toggle_listener()
+    
+    # --- Wi-Fi provisioning helpers ---
+    def _wifi_scan(self):
+        self.ssid_combo.clear()
+        self.ssid_combo.addItem("")
+        if py_platform.system() != 'Windows':
+            self.wifi_status.setText("Scan only implemented via netsh on Windows")
+            return
+        try:
+            out = subprocess.check_output(["netsh", "wlan", "show", "networks"], encoding='utf-8', errors='ignore')
+        except Exception as e:
+            self.wifi_status.setText(f"Scan failed: {e}")
+            return
+        ssids = []
+        for line in out.splitlines():
+            line = line.strip()
+            if line.startswith("SSID") and ':' in line:
+                parts = line.split(':', 1)
+                name = parts[1].strip()
+                if name:
+                    ssids.append(name)
+        uniq = []
+        for s in ssids:
+            if s not in uniq:
+                uniq.append(s)
+        for s in uniq:
+            self.ssid_combo.addItem(s)
+        self.wifi_status.setText(f"Found {len(uniq)} networks")
+
+    def _wifi_send(self):
+        ap_mode = self.ap_mode_cb.isChecked()
+        ssid = self.ssid_combo.currentText().strip()
+        pwd = self.pass_edit.text().strip()
+        if not ap_mode and not ssid:
+            QMessageBox.information(self, "Wi-Fi", "Enter SSID or enable Direct AP mode.")
+            return
+        if ap_mode and pwd and len(pwd) < 8:
+            res = QMessageBox.question(self, "Wi-Fi", "AP password <8 chars => open network. Continue?", QMessageBox.Yes | QMessageBox.No)
+            if res != QMessageBox.Yes:
+                return
+        flags = 0x01 if ap_mode else 0x00
+        ssid_bytes = ssid.encode('utf-8') if not ap_mode else b''
+        pass_bytes = pwd.encode('utf-8')
+        if len(ssid_bytes) > 255 or len(pass_bytes) > 255:
+            QMessageBox.warning(self, "Wi-Fi", "SSID or password too long (max 255 bytes)")
+            return
+        pkt = bytearray([0xE0, flags, len(ssid_bytes), len(pass_bytes)])
+        pkt.extend(ssid_bytes)
+        pkt.extend(pass_bytes)
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+            s.sendto(pkt, ("255.255.255.255", int(self.udp_port)))
+            s.close()
+        except Exception as e:
+            self.wifi_status.setText(f"Send failed: {e}")
+            return
+        self.wifi_status.setText("Sent provisioning packet; waiting ACK...")
+        self._prov_waiting = True
+        self._prov_deadline = time.time() + 6.0
+        if not (self.udp_thread and self.udp_thread.isRunning()):
+            self.toggle_listener()
+
+    def _on_prov_ack(self, status: int, sender: str):
+        if not self._prov_waiting:
+            return
+        if status == 0:
+            self.wifi_status.setText(f"ACK OK from {sender} (device rebooting)")
+        else:
+            self.wifi_status.setText(f"ACK error {status} from {sender}")
+        self._prov_waiting = False
+        self._prov_deadline = None
 
     # UI updates
     def _update_status(self):
@@ -757,6 +869,10 @@ class MainWindow(QMainWindow):
         sender = self.last_sender or '—'
         text = f"UDP:{self.udp_port}  Packets:{self.packet_count}  Last:{last} from {sender}  SSID:{ssid or 'unknown'}  IP:{ip or 'unknown'}"
         self.status.showMessage(text)
+        if self._prov_waiting and self._prov_deadline and time.time() > self._prov_deadline:
+            self.wifi_status.setText("Provision timeout (no ACK)")
+            self._prov_waiting = False
+            self._prov_deadline = None
 
     def on_recenter_toggle(self, state):
         self.recenter_edges = (state == Qt.Checked)

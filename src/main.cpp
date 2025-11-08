@@ -355,6 +355,9 @@ void setup(){
     });
     server.begin();
     Serial.println("Config server started at / (connect to AP 'ESP-Air-Setup')");
+    // Allow desktop app provisioning via UDP even while in config portal
+    udp.begin(UDP_PORT);
+    Serial.printf("UDP ready (config mode) on port %d for provisioning packets (0xE0)\n", UDP_PORT);
   } else {
     if (stored_ssid == "__AP__") {
       // Direct AP mode for mouse operation
@@ -433,16 +436,67 @@ void loop(){
   // --- Control packet handling (0xD2) for ML streaming start/stop ---
   int ctrlSize = udp.parsePacket();
   if (ctrlSize > 0) {
-    uint8_t cbuf[8];
+    // Read up to a reasonable maximum (provision packet may be larger than 8 bytes)
+    const int MAX_PKT = 160;
+    uint8_t cbuf[MAX_PKT];
     int rlen = udp.read(cbuf, sizeof(cbuf));
-    if (rlen >= 2 && cbuf[0] == 0xD2) {
-      uint8_t cmd = cbuf[1];
-      if (cmd == 0x01) {
-        rawStreaming = true;
-        Serial.println("Raw IMU streaming ENABLED");
-      } else if (cmd == 0x02) {
-        rawStreaming = false;
-        Serial.println("Raw IMU streaming DISABLED");
+    if (rlen >= 2) {
+      // --- Raw streaming control packet ---
+      if (cbuf[0] == 0xD2) {
+        uint8_t cmd = cbuf[1];
+        if (cmd == 0x01) {
+          rawStreaming = true;
+          Serial.println("Raw IMU streaming ENABLED");
+        } else if (cmd == 0x02) {
+          rawStreaming = false;
+          Serial.println("Raw IMU streaming DISABLED");
+        }
+      }
+      // --- Wi-Fi provisioning packet (desktop push) ---
+      // Format: [0]=0xE0, [1]=flags (bit0: direct AP mode), [2]=ssidLen, [3]=passLen, followed by ssid bytes, then pass bytes.
+      // If direct AP mode flag set: ssid ignored, pass used as AP password (may be empty). Stored ssid="__AP__".
+      // Device replies with ACK packet: header 0xE1, status byte (0=OK, !=0 error code), then schedules reboot.
+      else if (cbuf[0] == 0xE0) {
+        if (rlen < 4) {
+          Serial.println("Provision packet too short");
+        } else {
+          uint8_t flags = cbuf[1];
+          uint8_t ssidLen = cbuf[2];
+          uint8_t passLen = cbuf[3];
+          bool apMode = (flags & 0x01) != 0;
+          int expectedLen = 4 + ssidLen + passLen;
+          if (expectedLen > rlen) {
+            Serial.println("Provision length mismatch");
+          } else {
+            String newSsid;
+            String newPass;
+            int idx = 4;
+            if (!apMode) {
+              for (int i = 0; i < ssidLen; ++i) newSsid += (char)cbuf[idx++];
+            }
+            for (int i = 0; i < passLen; ++i) newPass += (char)cbuf[idx++];
+            if (apMode) {
+              prefs.putString("ssid", "__AP__");
+              prefs.putString("pass", newPass);
+              Serial.print("Provision: Stored Direct AP password len="); Serial.println(passLen);
+            } else {
+              prefs.putString("ssid", newSsid);
+              prefs.putString("pass", newPass);
+              Serial.print("Provision: Stored STA creds SSID='"); Serial.print(newSsid); Serial.print("' pass len="); Serial.println(passLen);
+            }
+            // Send ACK
+            uint8_t ack[3];
+            ack[0] = 0xE1; // ACK header
+            ack[1] = 0x00; // status OK
+            ack[2] = udp_seq++;
+            udp.beginPacket(udp.remoteIP(), udp.remotePort());
+            udp.write(ack, sizeof(ack));
+            udp.endPacket();
+            Serial.println("Provision ACK sent; rebooting in 750ms...");
+            delay(750);
+            ESP.restart();
+          }
+        }
       }
     }
   }
