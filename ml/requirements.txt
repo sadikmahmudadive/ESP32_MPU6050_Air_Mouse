@@ -1,0 +1,8 @@
+numpy
+pandas
+scikit-learn
+scipy
+matplotlib
+joblib
+# Optional for TF model + TFLite export
+# tensorflow>=2.6.0
