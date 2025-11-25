@@ -1129,46 +1129,24 @@ float readBatteryVoltage() {
   return batteryV;
 }
 
-// Improved LiPo single-cell SoC approximation for a typical 3.7V (1S) cell.
-// Based on a blended rest/discharge curve (light load). Voltage under load will sag;
-// treat this as an estimate. Below ~3.50V we rapidly approach empty; above 4.20V clamp.
-// If you routinely measure under higher load, consider adding IR compensation.
+// Adjusted for user specific max threshold of 3.7V (treating 3.7V as 100%)
 uint8_t voltageToPercent(float v) {
   // Hard clamps
-  if (v <= 3.50f) return 0;   // treat <3.50V as effectively empty to protect the cell
-  if (v >= 4.20f) return 100;
-  // Table of (voltage, percent). We'll interpolate between nearest lower & upper points.
+  if (v <= 3.30f) return 0;
+  if (v >= 3.70f) return 100;
+  // Table of (voltage, percent).
   struct VP { float vv; uint8_t pp; };
   static const VP curve[] = {
     //   V      %
-    {3.50f,  0},
-    {3.55f,  3},
-    {3.58f,  6},
-    {3.60f,  9},
-    {3.63f, 12},
-    {3.66f, 16},
-    {3.69f, 20},
-    {3.71f, 24},
-    {3.73f, 28},
-    {3.75f, 33},
-    {3.78f, 38},
-    {3.80f, 43},
-    {3.83f, 49},
-    {3.85f, 54},
-    {3.87f, 58},
-    {3.89f, 62},
-    {3.91f, 66},
-    {3.94f, 70},
-    {3.96f, 73},
-    {3.98f, 76},
-    {4.00f, 80},
-    {4.03f, 84},
-    {4.06f, 88},
-    {4.09f, 92},
-    {4.12f, 95},
-    {4.15f, 97},
-    {4.18f, 99},
-    {4.20f,100}
+    {3.30f,  0},
+    {3.35f, 10},
+    {3.40f, 25},
+    {3.45f, 40},
+    {3.50f, 55},
+    {3.55f, 70},
+    {3.60f, 85},
+    {3.65f, 95},
+    {3.70f,100}
   };
   // Find segment
   const int N = sizeof(curve)/sizeof(curve[0]);
