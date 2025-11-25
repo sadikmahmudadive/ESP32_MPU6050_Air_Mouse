@@ -9,6 +9,7 @@ from threading import Event
 import time
 import uuid
 from collections import deque
+import queue
 
 from PySide6 import QtCore, QtGui, QtWidgets
 from PySide6.QtCore import Qt, Signal, QTimer, QThread
@@ -208,7 +209,7 @@ class GestureRecorder(QtCore.QObject):
         # Batch advancement
         if self.batch_enabled and self.label_counts[self.active_label] >= self.target_per_label:
             # Advance label or finish
-            remaining = [l for l,c in self.label_counts.items() if c < self.target_per_label]
+            remaining = [l for l in self.labels if self.label_counts[l] < self.target_per_label]
             if remaining:
                 # pick next remaining label
                 for l in self.labels:
@@ -232,6 +233,10 @@ class UdpListener(QThread):
         super().__init__(parent)
         self.port = port
         self.stop_event = Event()
+        self.send_queue = queue.Queue()
+
+    def queue_send(self, pkt: bytes, ip: str, port: int):
+        self.send_queue.put((pkt, ip, port))
 
     def run(self):
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -242,8 +247,16 @@ class UdpListener(QThread):
         except Exception as e:
             self.logSignal.emit(f"UDP bind failed: {type(e).__name__} {e}")
             return
-        sock.settimeout(1.0)
+        sock.settimeout(0.1) # Faster timeout to check queue
         while not self.stop_event.is_set():
+            # Process send queue
+            while not self.send_queue.empty():
+                try:
+                    pkt, ip, port = self.send_queue.get_nowait()
+                    sock.sendto(pkt, (ip, port))
+                except Exception as e:
+                    self.logSignal.emit(f"UDP send error: {e}")
+
             try:
                 data, addr = sock.recvfrom(64)
             except socket.timeout:
@@ -698,6 +711,11 @@ class MainWindow(QMainWindow):
             sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
             pkt = bytes([0xD2, cmd])
             sock.sendto(pkt, ("255.255.255.255", int(self.udp_port)))
+            # Also try sending to the default AP IP (common for ESP32 AP mode)
+            try:
+                sock.sendto(pkt, ("192.168.4.1", int(self.udp_port)))
+            except:
+                pass
             sock.close()
         except Exception as e:
             self.log(f"Failed to send stream cmd {cmd}: {e}")
@@ -837,15 +855,29 @@ class MainWindow(QMainWindow):
         pkt = bytearray([0xE0, flags, len(ssid_bytes), len(pass_bytes)])
         pkt.extend(ssid_bytes)
         pkt.extend(pass_bytes)
-        try:
-            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            s.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
-            s.sendto(pkt, ("255.255.255.255", int(self.udp_port)))
-            s.close()
-        except Exception as e:
-            self.wifi_status.setText(f"Send failed: {e}")
-            return
-        self.wifi_status.setText("Sent provisioning packet; waiting ACK...")
+        
+        # Use the running UDP listener to send, so the ACK comes back to port 5555
+        if self.udp_thread and self.udp_thread.isRunning():
+            self.udp_thread.queue_send(pkt, "255.255.255.255", int(self.udp_port))
+            # Also try default AP IP
+            self.udp_thread.queue_send(pkt, "192.168.4.1", int(self.udp_port))
+            self.wifi_status.setText("Sent provisioning packet via listener; waiting ACK...")
+        else:
+            # Fallback if listener not running (should not happen usually)
+            try:
+                s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                s.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+                s.sendto(pkt, ("255.255.255.255", int(self.udp_port)))
+                try:
+                    s.sendto(pkt, ("192.168.4.1", int(self.udp_port)))
+                except:
+                    pass
+                s.close()
+                self.wifi_status.setText("Sent provisioning packet (blind); waiting ACK...")
+            except Exception as e:
+                self.wifi_status.setText(f"Send failed: {e}")
+                return
+
         self._prov_waiting = True
         self._prov_deadline = time.time() + 6.0
         if not (self.udp_thread and self.udp_thread.isRunning()):

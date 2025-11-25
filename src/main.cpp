@@ -22,6 +22,24 @@
 #include <WebServer.h>
 #include <Preferences.h>
 #include <WiFiUdp.h>
+#include <Firebase_ESP_Client.h>
+// Provide the token generation process info.
+#include <addons/TokenHelper.h>
+// Provide the RTDB payload printing info and other helper functions.
+#include <addons/RTDBHelper.h>
+
+/* 1. Define the Firebase Data object */
+FirebaseData fbdo;
+
+/* 2. Define the FirebaseAuth data for authentication data */
+FirebaseAuth auth;
+
+/* 3. Define the FirebaseConfig data for config data */
+FirebaseConfig config;
+
+#define FIREBASE_HOST "https://air-mouse-a0f08-default-rtdb.firebaseio.com/"
+// TODO: Insert your Firebase Web API Key here
+#define FIREBASE_AUTH "AIzaSyC9yJ8ztQfsYgIlr3ttqWFaagpQrrQ8es4"
 
 MPU6050 mpu(Wire);
 #if USE_BLE_MOUSE
@@ -243,6 +261,10 @@ unsigned long lastLeftClickMs = 0, lastRightClickMs = 0, lastBackClickMs = 0;
 const unsigned long MIN_CLICK_INTERVAL_MS = 200; // ms between clicks to avoid bounce/auto-fire
 const float CLICK_MOVE_THRESHOLD = 0.6f; // pixels per loop — if moving faster, suppress tap clicks
 
+unsigned long lastFirebaseSend = 0;
+const unsigned long FIREBASE_INTERVAL = 2000; // Send every 2 seconds to avoid lag
+bool signupOK = false;
+
 void setup(){
   Serial.begin(9600);
   // Ensure I2C is initialized on ESP32 pins. If your wiring uses different pins, change the constants above.
@@ -387,6 +409,34 @@ void setup(){
         Serial.print("Connected. IP: "); Serial.println(WiFi.localIP());
         udp.begin(UDP_PORT);
         Serial.printf("UDP ready (broadcast on port %d)\n", UDP_PORT);
+
+        /* Assign the api key (required) */
+        config.api_key = FIREBASE_AUTH;
+
+        /* Assign the RTDB URL (required) */
+        config.database_url = FIREBASE_HOST;
+
+        /* Sign up */
+        if (Firebase.signUp(&config, &auth, "", "")){
+          Serial.println("ok");
+          signupOK = true;
+        }
+        else{
+          Serial.printf("%s\n", config.signer.signupError.message.c_str());
+        }
+
+        /* Initialize the library with the Firebase authen and config */
+        Firebase.begin(&config, &auth);
+        Firebase.reconnectWiFi(true);
+
+        // Log connection history
+        if (Firebase.ready()) {
+           FirebaseJson json;
+           json.set("event", "connected");
+           json.set("timestamp", (double)millis());
+           json.set("ip", WiFi.localIP().toString());
+           Firebase.RTDB.pushJSON(&fbdo, "/history", &json);
+        }
       } else {
         Serial.println();
         Serial.println("Failed to connect to Wi‑Fi. Entering AP config mode.");
@@ -885,6 +935,30 @@ void loop(){
     }
   }
 
+  // Firebase logging (periodic)
+  if (signupOK && (now - lastFirebaseSend > FIREBASE_INTERVAL)) {
+    lastFirebaseSend = now;
+    if (Firebase.ready()) {
+      // Create a JSON object
+      FirebaseJson json;
+      json.set("timestamp", (double)now);
+      json.set("pitch", pitch);
+      json.set("roll", roll);
+      json.set("battery_v", readBatteryVoltage());
+      // Add raw IMU data
+      json.set("ax", ax_i); json.set("ay", ay_i); json.set("az", az_i);
+      json.set("gx", gx_i); json.set("gy", gy_i); json.set("gz", gz_i);
+      
+      // Push to /logs
+      // Note: pushJSON generates a unique key
+      if (Firebase.RTDB.pushJSON(&fbdo, "/logs", &json)) {
+        Serial.println("Firebase push success");
+      } else {
+        Serial.println(fbdo.errorReason());
+      }
+    }
+  }
+
   // Small yield to background tasks
   delay(0);
 
@@ -968,6 +1042,17 @@ void detectFlick(float gx, float gy, float gz, unsigned long now) {
 
       lastFlickTime = now;
       Serial.print("Flick detected! gmag="); Serial.println(gmag);
+
+      // Log ML event to Firebase
+      if (signupOK && Firebase.ready()) {
+          FirebaseJson json;
+          json.set("event", "flick");
+          json.set("timestamp", (double)now);
+          json.set("gmag", gmag);
+          json.set("gx", gx); json.set("gy", gy); json.set("gz", gz);
+          Firebase.RTDB.pushJSON(&fbdo, "/ml_events", &json);
+      }
+
       // Basic mapping: left-right flick -> browser back/forward
       if (abs(gx) > abs(gy) && abs(gx) > flickAxisMin) {
         if (gx > 0) sendBrowserBack();
