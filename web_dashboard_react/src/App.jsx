@@ -1,6 +1,6 @@
 import React, { useEffect, useState } from 'react';
 import { db } from './firebase';
-import { ref, query, limitToLast, onValue } from 'firebase/database';
+import { ref, query, limitToLast, onValue, remove, orderByChild, endAt, get } from 'firebase/database';
 import { LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, Legend, ResponsiveContainer } from 'recharts';
 import { Activity, Battery, Wifi, MousePointer2 } from 'lucide-react';
 
@@ -48,6 +48,35 @@ function App() {
       unsubscribeHistory();
       unsubscribeMl();
     };
+  }, []);
+
+  // Cleanup old data (older than 1 hour)
+  useEffect(() => {
+    const cleanupOldData = async () => {
+      const oneHourAgo = Date.now() - 3600000;
+      // Query logs older than 1 hour
+      const oldLogsRef = query(ref(db, 'logs'), orderByChild('timestamp'), endAt(oneHourAgo));
+      
+      try {
+        const snapshot = await get(oldLogsRef);
+        if (snapshot.exists()) {
+          let count = 0;
+          snapshot.forEach((child) => {
+            remove(child.ref);
+            count++;
+          });
+          console.log(`Cleaned up ${count} old log entries`);
+        }
+      } catch (error) {
+        console.error("Cleanup error:", error);
+      }
+    };
+
+    // Run on mount
+    cleanupOldData();
+    // And every 10 minutes
+    const interval = setInterval(cleanupOldData, 600000);
+    return () => clearInterval(interval);
   }, []);
 
   const latest = logs.length > 0 ? logs[logs.length - 1] : null;

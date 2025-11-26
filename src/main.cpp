@@ -6,6 +6,7 @@
 
 #include <Wire.h>
 #include <MPU6050_tockn.h>
+#include <time.h> // Added for NTP
 
 // Compile-time feature flags
 #ifndef USE_WIFI_MOUSE
@@ -407,6 +408,10 @@ void setup(){
       if (WiFi.status() == WL_CONNECTED) {
         Serial.println();
         Serial.print("Connected. IP: "); Serial.println(WiFi.localIP());
+        
+        // Init NTP
+        configTime(0, 0, "pool.ntp.org");
+        
         udp.begin(UDP_PORT);
         Serial.printf("UDP ready (broadcast on port %d)\n", UDP_PORT);
 
@@ -941,7 +946,14 @@ void loop(){
     if (Firebase.ready()) {
       // Create a JSON object
       FirebaseJson json;
-      json.set("timestamp", (double)now);
+      time_t t = time(nullptr);
+      if (t > 1000000000) {
+        // Valid NTP time (seconds), convert to ms for consistency with JS Date.now()
+        json.set("timestamp", (double)t * 1000.0);
+      } else {
+        // Fallback to millis if NTP not ready
+        json.set("timestamp", (double)now);
+      }
       json.set("pitch", pitch);
       json.set("roll", roll);
       json.set("battery_v", readBatteryVoltage());
